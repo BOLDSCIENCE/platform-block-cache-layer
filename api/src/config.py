@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     embedding_dimensions: int = 1024
     default_similarity_threshold: float = 0.92
 
+    # Stats aggregator (Phase 4)
+    application_id: str = ""
+    client_id: str = ""
+
 
 @lru_cache
 def get_settings() -> Settings:
