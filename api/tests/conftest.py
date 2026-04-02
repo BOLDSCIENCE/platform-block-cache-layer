@@ -11,7 +11,6 @@ os.environ["AWS_SECURITY_TOKEN"] = "testing"
 os.environ["AWS_SESSION_TOKEN"] = "testing"
 os.environ["OPENSEARCH_ENDPOINT"] = ""
 os.environ["MODEL_GATEWAY_API_URL"] = ""
-os.environ["MODEL_GATEWAY_API_KEY"] = ""
 
 import boto3
 import pytest

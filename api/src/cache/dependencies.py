@@ -5,7 +5,7 @@ from typing import Annotated
 
 import structlog
 from boldsci.auth import AuthContext
-from fastapi import Depends
+from fastapi import Depends, Request
 
 from src.auth.middleware import auth_middleware
 from src.cache.embedding_service import EmbeddingService
@@ -55,28 +55,19 @@ def get_opensearch_repository() -> OpenSearchRepository | None:
     return OpenSearchRepository(client)
 
 
-@lru_cache
-def _get_gateway_client():
-    """Get cached Model Gateway client singleton, or None if not configured."""
+def _build_gateway_client(api_key: str):
+    """Build a GatewayClient for the given API key, or None if not configured."""
     settings = get_settings()
-    if not settings.model_gateway_api_url or not settings.model_gateway_api_key:
+    if not settings.model_gateway_api_url or not api_key:
         return None
 
     from boldsci_model_gateway import GatewayClient
 
     return GatewayClient(
         api_url=settings.model_gateway_api_url,
-        api_key=settings.model_gateway_api_key,
+        api_key=api_key,
         timeout=10.0,
     )
-
-
-def get_embedding_service() -> EmbeddingService | None:
-    """Build an EmbeddingService or None if not configured."""
-    client = _get_gateway_client()
-    if client is None:
-        return None
-    return EmbeddingService(client)
 
 
 def get_cache_repository(
@@ -88,14 +79,23 @@ def get_cache_repository(
 
 
 def get_cache_service(
+    request: Request,
     repo: CacheRepository = Depends(get_cache_repository),
 ) -> CacheService:
-    """Build a CacheService with the tenant-scoped repository."""
+    """Build a CacheService with the tenant-scoped repository.
+
+    Creates a per-request GatewayClient using the caller's API key so that
+    Model Gateway calls are authenticated as the original caller.
+    """
+    caller_api_key = request.headers.get("x-api-key", "")
+    gateway_client = _build_gateway_client(caller_api_key)
+    embedding_svc = EmbeddingService(gateway_client) if gateway_client else None
+
     return CacheService(
         repository=repo,
         opensearch_repo=get_opensearch_repository(),
-        embedding_service=get_embedding_service(),
-        gateway_client=_get_gateway_client(),
+        embedding_service=embedding_svc,
+        gateway_client=gateway_client,
     )
 
 

@@ -54,10 +54,6 @@ data "aws_ssm_parameter" "model_gateway_api_url" {
   name = "/bold/model-gateway/api-url"
 }
 
-data "aws_ssm_parameter" "model_gateway_api_key" {
-  name            = "/bold/model-gateway/api-key"
-  with_decryption = true
-}
 
 # -----------------------------------------------------------------------------
 # Locals

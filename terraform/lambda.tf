@@ -44,7 +44,6 @@ resource "aws_lambda_function" "api" {
       ALLOWED_ORIGINS       = jsonencode(var.allowed_origins)
       OPENSEARCH_ENDPOINT   = aws_opensearch_domain.main.endpoint
       MODEL_GATEWAY_API_URL = data.aws_ssm_parameter.model_gateway_api_url.value
-      MODEL_GATEWAY_API_KEY = data.aws_ssm_parameter.model_gateway_api_key.value
     }
   }
 
