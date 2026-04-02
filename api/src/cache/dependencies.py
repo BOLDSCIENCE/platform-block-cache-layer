@@ -95,6 +95,7 @@ def get_cache_service(
         repository=repo,
         opensearch_repo=get_opensearch_repository(),
         embedding_service=get_embedding_service(),
+        gateway_client=_get_gateway_client(),
     )
 
 

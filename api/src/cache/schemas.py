@@ -246,3 +246,44 @@ class CacheStatsResponse(ApiModel):
     project_id: str
     period: str
     stats: CacheStatsDetail
+
+
+# ---------------------------------------------------------------------------
+# Lookup-or-Exec
+# ---------------------------------------------------------------------------
+
+
+class OnMissConfig(ApiModel):
+    """Configuration for what to do on a cache miss in lookup-or-exec."""
+
+    model: str
+    messages: list[dict[str, Any]] = Field(default_factory=list)
+    cache_response: bool = True
+    ttl_seconds: int = 86400
+
+
+class LookupOrExecRequest(ApiModel):
+    """POST /v1/cache/lookup-or-exec request body."""
+
+    workspace_id: str
+    project_id: str
+    query: str
+    request_id: str | None = None
+    context_hash: str | None = None
+    lookup_config: LookupConfig = Field(default_factory=LookupConfig)
+    on_miss: OnMissConfig
+
+
+class LookupOrExecResponse(ApiModel):
+    """POST /v1/cache/lookup-or-exec response body."""
+
+    request_id: str | None = None
+    status: str  # "hit" or "miss_executed"
+    source: str | None = None  # "exact", "semantic", or "model_gateway"
+    cache_entry_id: str | None = None
+    response: CachedResponse | None = None
+    similarity_score: float | None = None
+    matched_query: str | None = None
+    cache_metadata: CacheMetadata | None = None
+    lookup_latency_ms: float = 0
+    stages: LookupStages | None = None

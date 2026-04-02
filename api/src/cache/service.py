@@ -32,7 +32,10 @@ from src.cache.schemas import (
     CacheStatsResponse,
     CacheWriteRequest,
     CacheWriteResponse,
+    LookupOrExecRequest,
+    LookupOrExecResponse,
     LookupStages,
+    WriteConfig,
 )
 from src.common.exceptions import PurgeRequiresConfirmError
 from src.config import get_settings
@@ -48,10 +51,12 @@ class CacheService:
         repository: CacheRepository,
         opensearch_repo=None,
         embedding_service=None,
+        gateway_client=None,
     ):
         self.repository = repository
         self.opensearch_repo = opensearch_repo
         self.embedding_service = embedding_service
+        self.gateway_client = gateway_client
 
     @property
     def _semantic_available(self) -> bool:
@@ -604,3 +609,87 @@ class CacheService:
             )
         except Exception:
             logger.warning("stats.increment_failed", hit_type=hit_type)
+
+    # -----------------------------------------------------------------
+    # Lookup-or-Exec (Phase 4)
+    # -----------------------------------------------------------------
+
+    def lookup_or_exec(self, request: LookupOrExecRequest) -> LookupOrExecResponse:
+        """Cache-aside: lookup first, on miss invoke Model Gateway SDK."""
+        from src.common.exceptions import GatewayNotConfiguredError
+
+        # Step 1: Try cache lookup
+        lookup_req = CacheLookupRequest(
+            workspace_id=request.workspace_id,
+            project_id=request.project_id,
+            query=request.query,
+            request_id=request.request_id,
+            context_hash=request.context_hash,
+            lookup_config=request.lookup_config,
+        )
+
+        lookup_result = self.lookup(lookup_req)
+
+        if lookup_result.status == "hit":
+            return LookupOrExecResponse(
+                request_id=request.request_id,
+                status="hit",
+                source=lookup_result.source,
+                cache_entry_id=lookup_result.cache_entry_id,
+                response=lookup_result.response,
+                similarity_score=lookup_result.similarity_score,
+                matched_query=lookup_result.matched_query,
+                cache_metadata=lookup_result.cache_metadata,
+                lookup_latency_ms=lookup_result.lookup_latency_ms,
+                stages=lookup_result.stages,
+            )
+
+        # Step 2: Cache miss — invoke Model Gateway
+        if self.gateway_client is None:
+            raise GatewayNotConfiguredError()
+
+        start = time.monotonic()
+        gw_response = self.gateway_client.invoke(
+            model=request.on_miss.model,
+            messages=request.on_miss.messages,
+            max_tokens=4096,
+        )
+        invoke_ms = (time.monotonic() - start) * 1000
+
+        content = gw_response.choices[0].message.content
+        input_tokens = gw_response.usage.input_tokens
+        output_tokens = gw_response.usage.output_tokens
+        model_alias = gw_response.gateway.model_alias
+
+        cached_response = CachedResponse(
+            content=content,
+            model=model_alias,
+            tokens_used={"input": input_tokens, "output": output_tokens},
+        )
+
+        # Step 3: Cache the result (if enabled)
+        cache_entry_id = None
+        if request.on_miss.cache_response:
+            write_req = CacheWriteRequest(
+                workspace_id=request.workspace_id,
+                project_id=request.project_id,
+                query=request.query,
+                response=cached_response,
+                request_id=request.request_id,
+                context_hash=request.context_hash,
+                write_config=WriteConfig(ttl_seconds=request.on_miss.ttl_seconds),
+            )
+            write_result = self.write(write_req)
+            cache_entry_id = write_result.cache_entry_id
+
+        total_ms = lookup_result.lookup_latency_ms + invoke_ms
+
+        return LookupOrExecResponse(
+            request_id=request.request_id,
+            status="miss_executed",
+            source="model_gateway",
+            cache_entry_id=cache_entry_id,
+            response=cached_response,
+            lookup_latency_ms=round(total_ms, 2),
+            stages=lookup_result.stages,
+        )

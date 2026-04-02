@@ -414,3 +414,47 @@ class TestCacheStats:
             params={"workspace_id": "ws_01", "project_id": "proj_01"},
         )
         assert response.status_code == 401
+
+
+class TestCacheLookupOrExec:
+    def test_hit_returns_cached(self, client):
+        # Write an entry first
+        client.post(
+            "/v1/cache/write",
+            json={
+                "workspaceId": "ws_01",
+                "projectId": "proj_01",
+                "query": "lookup-or-exec cached?",
+                "response": {
+                    "content": "cached answer",
+                    "model": "m",
+                    "tokensUsed": {},
+                },
+            },
+        )
+
+        response = client.post(
+            "/v1/cache/lookup-or-exec",
+            json={
+                "workspaceId": "ws_01",
+                "projectId": "proj_01",
+                "query": "lookup-or-exec cached?",
+                "onMiss": {"model": "m", "messages": []},
+            },
+        )
+        assert response.status_code == 200
+        data = unwrap(response)
+        assert data["status"] == "hit"
+        assert data["response"]["content"] == "cached answer"
+
+    def test_requires_write_scope(self, read_client):
+        response = read_client.post(
+            "/v1/cache/lookup-or-exec",
+            json={
+                "workspaceId": "ws_01",
+                "projectId": "proj_01",
+                "query": "test?",
+                "onMiss": {"model": "m", "messages": []},
+            },
+        )
+        assert response.status_code == 403

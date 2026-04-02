@@ -63,6 +63,16 @@ class PurgeRequiresConfirmError(AppError):
         super().__init__("Purge requires confirm: true", code="PURGE_REQUIRES_CONFIRM")
 
 
+class GatewayNotConfiguredError(AppError):
+    """Model Gateway not configured (503)."""
+
+    def __init__(self):
+        super().__init__(
+            "Lookup-or-exec requires Model Gateway integration",
+            code="GATEWAY_NOT_CONFIGURED",
+        )
+
+
 EXCEPTION_STATUS_MAP: dict[type[AppError], int] = {
     NotFoundError: 404,
     ConflictError: 409,
@@ -71,4 +81,5 @@ EXCEPTION_STATUS_MAP: dict[type[AppError], int] = {
     CacheEntryNotFoundError: 404,
     CacheWriteFailedError: 500,
     PurgeRequiresConfirmError: 400,
+    GatewayNotConfiguredError: 503,
 }

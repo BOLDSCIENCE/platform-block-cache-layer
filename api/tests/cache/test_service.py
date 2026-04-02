@@ -871,3 +871,141 @@ class TestStatsIncrement:
         assert len(buckets) >= 1
         bucket = buckets[0]
         assert int(bucket.get("misses", 0)) == 1
+
+
+class TestLookupOrExec:
+    """Tests for the lookup-or-exec cache-aside pattern."""
+
+    def test_hit_returns_cached(self, cache_service):
+        """On cache hit, returns the cached response without invoking Model Gateway."""
+        from src.cache.schemas import (
+            CachedResponse,
+            CacheWriteRequest,
+            LookupOrExecRequest,
+            OnMissConfig,
+        )
+
+        # Pre-populate cache
+        cache_service.write(
+            CacheWriteRequest(
+                workspace_id="ws_01",
+                project_id="proj_01",
+                query="cached question?",
+                response=CachedResponse(
+                    content="cached answer",
+                    model="m",
+                    tokens_used={"input": 10, "output": 5},
+                ),
+            )
+        )
+
+        req = LookupOrExecRequest(
+            workspace_id="ws_01",
+            project_id="proj_01",
+            query="cached question?",
+            on_miss=OnMissConfig(model="anthropic.claude-sonnet-4-5-20250929", messages=[]),
+        )
+
+        result = cache_service.lookup_or_exec(req)
+        assert result.status == "hit"
+        assert result.source == "exact"
+        assert result.response.content == "cached answer"
+
+    def test_miss_invokes_gateway_and_caches(self, cache_service):
+        """On cache miss, invokes Model Gateway SDK and caches the result."""
+        from src.cache.schemas import (
+            CacheLookupRequest,
+            LookupOrExecRequest,
+            OnMissConfig,
+        )
+
+        # Mock the gateway client
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "generated answer"
+        mock_response.usage.input_tokens = 50
+        mock_response.usage.output_tokens = 30
+        mock_response.gateway.model_alias = "anthropic.claude-sonnet-4-5-20250929"
+
+        mock_client = MagicMock()
+        mock_client.invoke.return_value = mock_response
+        cache_service.gateway_client = mock_client
+
+        req = LookupOrExecRequest(
+            workspace_id="ws_01",
+            project_id="proj_01",
+            query="new question?",
+            on_miss=OnMissConfig(
+                model="anthropic.claude-sonnet-4-5-20250929",
+                messages=[{"role": "user", "content": "new question?"}],
+            ),
+        )
+
+        result = cache_service.lookup_or_exec(req)
+        assert result.status == "miss_executed"
+        assert result.source == "model_gateway"
+        assert result.response.content == "generated answer"
+
+        # Verify it was cached
+        lookup = CacheLookupRequest(
+            workspace_id="ws_01",
+            project_id="proj_01",
+            query="new question?",
+        )
+        cached = cache_service.lookup(lookup)
+        assert cached.status == "hit"
+
+    def test_miss_without_gateway_returns_503(self, cache_service):
+        """If gateway client is not configured, raises GatewayNotConfiguredError on miss."""
+        from src.cache.schemas import LookupOrExecRequest, OnMissConfig
+        from src.common.exceptions import GatewayNotConfiguredError
+
+        cache_service.gateway_client = None
+
+        req = LookupOrExecRequest(
+            workspace_id="ws_01",
+            project_id="proj_01",
+            query="uncached question?",
+            on_miss=OnMissConfig(model="m", messages=[]),
+        )
+
+        with pytest.raises(GatewayNotConfiguredError):
+            cache_service.lookup_or_exec(req)
+
+    def test_miss_no_cache_when_disabled(self, cache_service):
+        """When cache_response=False, the result is not cached."""
+        from src.cache.schemas import (
+            CacheLookupRequest,
+            LookupOrExecRequest,
+            OnMissConfig,
+        )
+
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "ephemeral answer"
+        mock_response.usage.input_tokens = 10
+        mock_response.usage.output_tokens = 5
+        mock_response.gateway.model_alias = "m"
+
+        mock_client = MagicMock()
+        mock_client.invoke.return_value = mock_response
+        cache_service.gateway_client = mock_client
+
+        req = LookupOrExecRequest(
+            workspace_id="ws_01",
+            project_id="proj_01",
+            query="ephemeral question?",
+            on_miss=OnMissConfig(model="m", messages=[], cache_response=False),
+        )
+
+        result = cache_service.lookup_or_exec(req)
+        assert result.status == "miss_executed"
+
+        # Should NOT be cached
+        lookup = CacheLookupRequest(
+            workspace_id="ws_01",
+            project_id="proj_01",
+            query="ephemeral question?",
+        )
+        cached = cache_service.lookup(lookup)
+        assert cached.status == "miss"

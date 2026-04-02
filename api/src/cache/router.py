@@ -18,6 +18,8 @@ from src.cache.schemas import (
     CacheStatsResponse,
     CacheWriteRequest,
     CacheWriteResponse,
+    LookupOrExecRequest,
+    LookupOrExecResponse,
 )
 
 router = APIRouter(prefix="/cache", tags=["cache"])
@@ -114,3 +116,14 @@ def cache_stats(
     """Get cache statistics for a scope."""
     require_read(auth)
     return service.get_stats(workspace_id, project_id, period)
+
+
+@router.post("/lookup-or-exec", response_model=LookupOrExecResponse)
+def cache_lookup_or_exec(
+    body: LookupOrExecRequest,
+    auth: Auth,
+    service: CacheServiceDep,
+) -> LookupOrExecResponse:
+    """Cache-aside lookup: hit returns cached, miss invokes Model Gateway and caches."""
+    require_write(auth)
+    return service.lookup_or_exec(body)
