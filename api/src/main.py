@@ -52,9 +52,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 
 app = FastAPI(
-    title="Cache Layer API",
-    description="Intelligent response caching for AI applications",
-    version="0.1.0",
+    title="Bold Cache Layer API",
+    description="Intelligent response caching for AI applications. "
+    "Provides exact match and semantic similarity caching with "
+    "lookup-or-exec cache-aside pattern, statistics, and cost savings tracking.",
+    version="0.4.0",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -160,7 +162,7 @@ def get_root() -> dict[str, str]:
     """Root endpoint."""
     return {
         "service": settings.service_name,
-        "version": "0.1.0",
+        "version": "0.4.0",
     }
 
 
