@@ -5,6 +5,7 @@ from typing import Any
 
 from fastapi import APIRouter
 
+from src.cache.dependencies import _get_opensearch_client
 from src.common.dependencies import get_dynamodb_table
 from src.config import get_settings
 
@@ -35,12 +36,36 @@ def _check_health() -> dict[str, Any]:
     except Exception:
         db_status = "unhealthy"
 
-    status = "healthy" if db_status == "healthy" else "degraded"
+    # OpenSearch health
+    os_status = "not_configured"
+    if settings.opensearch_endpoint:
+        try:
+            os_client = _get_opensearch_client()
+            if os_client is not None:
+                health = os_client.cluster.health()
+                cluster_status = health.get("status")
+                os_status = "healthy" if cluster_status in ("green", "yellow") else "unhealthy"
+            else:
+                os_status = "unhealthy"
+        except Exception:
+            os_status = "unhealthy"
+
+    # Model Gateway config check (no active probe)
+    mg_status = "configured" if settings.model_gateway_api_url else "not_configured"
+
+    all_healthy = db_status == "healthy"
+    any_unhealthy = db_status == "unhealthy" or os_status == "unhealthy"
+    status = "healthy" if all_healthy and not any_unhealthy else "degraded"
+
     result = {
         "status": status,
         "service": "cache-layer-api",
         "version": "0.1.0",
-        "dependencies": {"dynamodb": db_status},
+        "dependencies": {
+            "dynamodb": db_status,
+            "opensearch": os_status,
+            "model_gateway": mg_status,
+        },
     }
 
     _cached_result = result

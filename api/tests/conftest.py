@@ -9,6 +9,9 @@ os.environ["AWS_ACCESS_KEY_ID"] = "testing"
 os.environ["AWS_SECRET_ACCESS_KEY"] = "testing"
 os.environ["AWS_SECURITY_TOKEN"] = "testing"
 os.environ["AWS_SESSION_TOKEN"] = "testing"
+os.environ["OPENSEARCH_ENDPOINT"] = ""
+os.environ["MODEL_GATEWAY_API_URL"] = ""
+os.environ["MODEL_GATEWAY_API_KEY"] = ""
 
 import boto3
 import pytest
@@ -51,6 +54,8 @@ def dynamodb_tables():
                 {"AttributeName": "GSI1SK", "AttributeType": "S"},
                 {"AttributeName": "GSI2PK", "AttributeType": "S"},
                 {"AttributeName": "GSI2SK", "AttributeType": "S"},
+                {"AttributeName": "GSI3PK", "AttributeType": "S"},
+                {"AttributeName": "GSI3SK", "AttributeType": "S"},
             ],
             GlobalSecondaryIndexes=[
                 {
@@ -68,6 +73,14 @@ def dynamodb_tables():
                         {"AttributeName": "GSI2SK", "KeyType": "RANGE"},
                     ],
                     "Projection": {"ProjectionType": "ALL"},
+                },
+                {
+                    "IndexName": "GSI3",
+                    "KeySchema": [
+                        {"AttributeName": "GSI3PK", "KeyType": "HASH"},
+                        {"AttributeName": "GSI3SK", "KeyType": "RANGE"},
+                    ],
+                    "Projection": {"ProjectionType": "KEYS_ONLY"},
                 },
             ],
             BillingMode="PAY_PER_REQUEST",
@@ -144,6 +157,20 @@ def client(dynamodb_tables, admin_auth_context) -> TestClient:
 
 
 @pytest.fixture
+def write_client(dynamodb_tables, write_auth_context) -> TestClient:
+    """Create a FastAPI TestClient with write auth (no admin)."""
+    from src.auth.middleware import auth_middleware
+    from src.main import app
+
+    app.dependency_overrides[auth_middleware] = _make_auth_override(write_auth_context)
+
+    test_client = TestClient(app)
+    yield test_client
+
+    app.dependency_overrides.pop(auth_middleware, None)
+
+
+@pytest.fixture
 def read_client(dynamodb_tables, read_auth_context) -> TestClient:
     """Create a FastAPI TestClient with read-only auth."""
     from src.auth.middleware import auth_middleware
@@ -187,3 +214,14 @@ def _reset_singletons():
 
     health_router._cached_result = None
     health_router._cached_at = 0.0
+
+
+@pytest.fixture(autouse=True)
+def _reset_circuit_breakers():
+    """Reset circuit breakers between tests."""
+    yield
+    from src.cache.embedding_service import _circuit_breaker as embed_cb
+    from src.cache.opensearch_repository import _circuit_breaker as os_cb
+
+    embed_cb.reset()
+    os_cb.reset()

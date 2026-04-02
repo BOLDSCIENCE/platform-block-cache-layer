@@ -52,6 +52,19 @@ variable "custom_domain" {
   default     = ""
 }
 
+# Event handler Lambda variables
+variable "event_handler_lambda_memory_size" {
+  type        = number
+  description = "Memory size for the Event Handler Lambda (MB)"
+  default     = 256
+}
+
+variable "event_handler_lambda_timeout" {
+  type        = number
+  description = "Timeout for the Event Handler Lambda (seconds)"
+  default     = 60
+}
+
 # OpenSearch variables
 variable "opensearch_instance_type" {
   type        = string

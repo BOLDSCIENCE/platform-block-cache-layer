@@ -56,6 +56,13 @@ class CacheWriteFailedError(AppError):
         super().__init__(message, code="CACHE_WRITE_FAILED")
 
 
+class PurgeRequiresConfirmError(AppError):
+    """Purge requires confirm: true (400)."""
+
+    def __init__(self):
+        super().__init__("Purge requires confirm: true", code="PURGE_REQUIRES_CONFIRM")
+
+
 EXCEPTION_STATUS_MAP: dict[type[AppError], int] = {
     NotFoundError: 404,
     ConflictError: 409,
@@ -63,4 +70,5 @@ EXCEPTION_STATUS_MAP: dict[type[AppError], int] = {
     AuthorizationError: 403,
     CacheEntryNotFoundError: 404,
     CacheWriteFailedError: 500,
+    PurgeRequiresConfirmError: 400,
 }

@@ -213,6 +213,164 @@ class TestAuth:
         assert resp.status_code == 403
 
 
+class TestCacheInvalidate:
+    def test_invalidate_with_criteria(self, client):
+        # Write some entries
+        for q in ["password reset help", "password change", "weather forecast"]:
+            client.post(
+                "/v1/cache/write",
+                json={
+                    "workspace_id": "ws_01",
+                    "project_id": "proj_01",
+                    "query": q,
+                    "response": {"content": f"answer for {q}"},
+                },
+            )
+
+        # Invalidate entries matching "password"
+        resp = client.post(
+            "/v1/cache/invalidate",
+            json={
+                "workspace_id": "ws_01",
+                "project_id": "proj_01",
+                "invalidation_criteria": {"query_contains": "password"},
+            },
+        )
+        assert resp.status_code == 200
+        data = unwrap(resp)
+        assert data["entriesInvalidated"] == 2
+
+        # Weather should still be a hit
+        lookup_resp = client.post(
+            "/v1/cache/lookup",
+            json={
+                "workspace_id": "ws_01",
+                "project_id": "proj_01",
+                "query": "weather forecast",
+            },
+        )
+        assert unwrap(lookup_resp)["status"] == "hit"
+
+        # Password should be a miss
+        lookup_resp2 = client.post(
+            "/v1/cache/lookup",
+            json={
+                "workspace_id": "ws_01",
+                "project_id": "proj_01",
+                "query": "password reset help",
+            },
+        )
+        assert unwrap(lookup_resp2)["status"] == "miss"
+
+    def test_invalidate_requires_write_scope(self, read_client):
+        resp = read_client.post(
+            "/v1/cache/invalidate",
+            json={
+                "workspace_id": "ws_01",
+                "project_id": "proj_01",
+                "invalidation_criteria": {},
+            },
+        )
+        assert resp.status_code == 403
+
+
+class TestCachePurge:
+    def test_purge_with_confirm(self, client):
+        # Write entries
+        for i in range(3):
+            client.post(
+                "/v1/cache/write",
+                json={
+                    "workspace_id": "ws_01",
+                    "project_id": "proj_01",
+                    "query": f"purge test {i}?",
+                    "response": {"content": f"answer {i}"},
+                },
+            )
+
+        resp = client.post(
+            "/v1/cache/purge",
+            json={
+                "workspace_id": "ws_01",
+                "project_id": "proj_01",
+                "confirm": True,
+            },
+        )
+        assert resp.status_code == 200
+        data = unwrap(resp)
+        assert data["entriesPurged"] == 3
+
+    def test_purge_reject_without_confirm(self, client):
+        resp = client.post(
+            "/v1/cache/purge",
+            json={
+                "workspace_id": "ws_01",
+                "project_id": "proj_01",
+                "confirm": False,
+            },
+        )
+        assert resp.status_code == 400
+
+    def test_purge_requires_admin_scope(self, write_client):
+        resp = write_client.post(
+            "/v1/cache/purge",
+            json={
+                "workspace_id": "ws_01",
+                "project_id": "proj_01",
+                "confirm": True,
+            },
+        )
+        assert resp.status_code == 403
+
+
+class TestCacheConfig:
+    def test_get_config_returns_defaults(self, client):
+        resp = client.get(
+            "/v1/cache/config",
+            params={"workspace_id": "ws_01", "project_id": "proj_01"},
+        )
+        assert resp.status_code == 200
+        data = unwrap(resp)
+        assert data["config"]["enabled"] is True
+        assert data["config"]["defaultTtlSeconds"] == 86400
+
+    def test_put_config(self, client):
+        resp = client.put(
+            "/v1/cache/config",
+            json={
+                "workspace_id": "ws_01",
+                "project_id": "proj_01",
+                "config": {
+                    "enabled": False,
+                    "default_ttl_seconds": 3600,
+                },
+            },
+        )
+        assert resp.status_code == 200
+        data = unwrap(resp)
+        assert data["config"]["enabled"] is False
+        assert data["config"]["defaultTtlSeconds"] == 3600
+
+        # GET should return updated config
+        get_resp = client.get(
+            "/v1/cache/config",
+            params={"workspace_id": "ws_01", "project_id": "proj_01"},
+        )
+        get_data = unwrap(get_resp)
+        assert get_data["config"]["enabled"] is False
+
+    def test_put_config_requires_admin_scope(self, write_client):
+        resp = write_client.put(
+            "/v1/cache/config",
+            json={
+                "workspace_id": "ws_01",
+                "project_id": "proj_01",
+                "config": {"enabled": True},
+            },
+        )
+        assert resp.status_code == 403
+
+
 class TestResponseEnvelope:
     def test_response_has_data_and_meta(self, client):
         resp = client.post(

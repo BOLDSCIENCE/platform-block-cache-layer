@@ -1,12 +1,14 @@
-"""Cache service — lookup, write, and delete pipeline logic."""
+"""Cache service — lookup, write, delete, invalidate, purge, config logic."""
+
+from __future__ import annotations
 
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import structlog
 import ulid
 
-from src.cache.models import CacheEntryModel
+from src.cache.models import CacheConfigModel, CacheEntryModel, InvalidationEventModel
 from src.cache.normalizer import (
     build_cache_sk,
     build_pk,
@@ -15,15 +17,24 @@ from src.cache.normalizer import (
 )
 from src.cache.repository import CacheRepository
 from src.cache.schemas import (
+    CacheConfig,
+    CacheConfigRequest,
+    CacheConfigResponse,
     CacheDeleteResponse,
     CachedResponse,
+    CacheInvalidateRequest,
+    CacheInvalidateResponse,
     CacheLookupRequest,
     CacheLookupResponse,
     CacheMetadata,
+    CachePurgeRequest,
+    CachePurgeResponse,
     CacheWriteRequest,
     CacheWriteResponse,
     LookupStages,
 )
+from src.common.exceptions import PurgeRequiresConfirmError
+from src.config import get_settings
 
 logger = structlog.get_logger()
 
@@ -31,16 +42,28 @@ logger = structlog.get_logger()
 class CacheService:
     """Orchestrates cache lookup, write, and delete operations."""
 
-    def __init__(self, repository: CacheRepository):
+    def __init__(
+        self,
+        repository: CacheRepository,
+        opensearch_repo=None,
+        embedding_service=None,
+    ):
         self.repository = repository
+        self.opensearch_repo = opensearch_repo
+        self.embedding_service = embedding_service
+
+    @property
+    def _semantic_available(self) -> bool:
+        return self.opensearch_repo is not None and self.embedding_service is not None
 
     def lookup(self, request: CacheLookupRequest) -> CacheLookupResponse:
-        """Execute cache lookup pipeline (exact match only in Phase 1)."""
+        """Execute cache lookup pipeline (exact match → semantic similarity)."""
         start = time.monotonic()
 
         normalized = normalize_query(request.query)
         query_hash = compute_query_hash(normalized)
 
+        # --- Exact match tier ---
         exact_start = time.monotonic()
         entry = None
 
@@ -65,47 +88,135 @@ class CacheService:
                         stages=LookupStages(exact_match_ms=round(exact_ms, 2)),
                     )
 
-            # Hit — increment hit count
-            pk = build_pk(self.repository.application_id, self.repository.client_id)
-            sk = build_cache_sk(entry.workspace_id, entry.project_id, entry.cache_entry_id)
-            now = datetime.now(UTC).isoformat()
-            try:
-                self.repository.increment_hit_count(pk, sk, now)
-            except Exception:
-                logger.warning("Failed to increment hit count", entry_id=entry.cache_entry_id)
+            return self._build_hit_response(entry, "exact", request, start, exact_ms)
 
-            total_ms = (time.monotonic() - start) * 1000
-            ttl_remaining = None
-            if entry.ttl:
-                ttl_remaining = max(0, entry.ttl - int(datetime.now(UTC).timestamp()))
+        # --- Semantic similarity tier ---
+        embedding_ms = None
+        semantic_ms = None
 
-            return CacheLookupResponse(
-                request_id=request.request_id,
-                status="hit",
-                source="exact",
-                cache_entry_id=entry.cache_entry_id,
-                response=CachedResponse(
-                    content=entry.response.get("content", ""),
-                    model=entry.model,
-                    tokens_used=entry.tokens_used,
-                    citations=entry.citations,
-                ),
-                cache_metadata=CacheMetadata(
-                    created_at=entry.created_at,
-                    hit_count=entry.hit_count + 1,
-                    last_hit_at=now,
-                    ttl_remaining_seconds=ttl_remaining,
-                ),
-                lookup_latency_ms=round(total_ms, 2),
-            )
+        if request.lookup_config.enable_semantic and self._semantic_available:
+            embed_start = time.monotonic()
+            query_embedding = self.embedding_service.generate_embedding(normalized)
+            embedding_ms = (time.monotonic() - embed_start) * 1000
 
-        # Miss
+            if query_embedding is not None:
+                sem_start = time.monotonic()
+                match = self.opensearch_repo.search_similar(
+                    query_embedding=query_embedding,
+                    application_id=self.repository.application_id,
+                    client_id=self.repository.client_id,
+                    workspace_id=request.workspace_id,
+                    project_id=request.project_id,
+                    threshold=request.lookup_config.similarity_threshold,
+                )
+                semantic_ms = (time.monotonic() - sem_start) * 1000
+
+                if match is not None:
+                    # Hydrate full entry from DynamoDB
+                    entry = self.repository.get_by_id(
+                        match["cache_entry_id"],
+                        request.workspace_id,
+                        request.project_id,
+                    )
+
+                    if entry is not None:
+                        # Check max_age on semantic match
+                        if request.lookup_config.max_age_seconds is not None:
+                            created = datetime.fromisoformat(entry.created_at)
+                            age = (datetime.now(UTC) - created).total_seconds()
+                            if age > request.lookup_config.max_age_seconds:
+                                total_ms = (time.monotonic() - start) * 1000
+                                return CacheLookupResponse(
+                                    request_id=request.request_id,
+                                    status="miss",
+                                    lookup_latency_ms=round(total_ms, 2),
+                                    stages=LookupStages(
+                                        exact_match_ms=round(exact_ms, 2),
+                                        embedding_ms=(
+                                            round(embedding_ms, 2) if embedding_ms else None
+                                        ),
+                                        semantic_match_ms=(
+                                            round(semantic_ms, 2) if semantic_ms else None
+                                        ),
+                                    ),
+                                )
+
+                        return self._build_hit_response(
+                            entry,
+                            "semantic",
+                            request,
+                            start,
+                            exact_ms,
+                            embedding_ms=embedding_ms,
+                            semantic_ms=semantic_ms,
+                            similarity_score=match["score"],
+                            matched_query=match["query_normalized"],
+                        )
+
+        # --- Miss ---
         total_ms = (time.monotonic() - start) * 1000
         return CacheLookupResponse(
             request_id=request.request_id,
             status="miss",
             lookup_latency_ms=round(total_ms, 2),
-            stages=LookupStages(exact_match_ms=round(exact_ms, 2)),
+            stages=LookupStages(
+                exact_match_ms=round(exact_ms, 2),
+                embedding_ms=round(embedding_ms, 2) if embedding_ms else None,
+                semantic_match_ms=round(semantic_ms, 2) if semantic_ms else None,
+            ),
+        )
+
+    def _build_hit_response(
+        self,
+        entry: CacheEntryModel,
+        source: str,
+        request: CacheLookupRequest,
+        start: float,
+        exact_ms: float,
+        embedding_ms: float | None = None,
+        semantic_ms: float | None = None,
+        similarity_score: float | None = None,
+        matched_query: str | None = None,
+    ) -> CacheLookupResponse:
+        """Build a cache hit response and increment hit count."""
+        pk = build_pk(self.repository.application_id, self.repository.client_id)
+        sk = build_cache_sk(entry.workspace_id, entry.project_id, entry.cache_entry_id)
+        now = datetime.now(UTC).isoformat()
+        try:
+            self.repository.increment_hit_count(pk, sk, now)
+        except Exception:
+            logger.warning("Failed to increment hit count", entry_id=entry.cache_entry_id)
+
+        total_ms = (time.monotonic() - start) * 1000
+        ttl_remaining = None
+        if entry.ttl:
+            ttl_remaining = max(0, entry.ttl - int(datetime.now(UTC).timestamp()))
+
+        return CacheLookupResponse(
+            request_id=request.request_id,
+            status="hit",
+            source=source,
+            cache_entry_id=entry.cache_entry_id,
+            similarity_score=similarity_score,
+            matched_query=matched_query,
+            response=CachedResponse(
+                content=entry.response.get("content", ""),
+                model=entry.model,
+                tokens_used=entry.tokens_used,
+                citations=entry.citations,
+            ),
+            cache_metadata=CacheMetadata(
+                created_at=entry.created_at,
+                hit_count=entry.hit_count + 1,
+                last_hit_at=now,
+                ttl_remaining_seconds=ttl_remaining,
+            ),
+            lookup_latency_ms=round(total_ms, 2),
+            stages=LookupStages(
+                exact_match_ms=round(exact_ms, 2),
+                embedding_ms=round(embedding_ms, 2) if embedding_ms else None,
+                semantic_match_ms=round(semantic_ms, 2) if semantic_ms else None,
+            ),
         )
 
     def write(self, request: CacheWriteRequest, user_id: str | None = None) -> CacheWriteResponse:
@@ -144,11 +255,45 @@ class CacheService:
 
         self.repository.put(entry)
 
+        # Write citation links for document-based invalidation
+        doc_ids = self._extract_document_ids(request.response.citations)
+        if doc_ids:
+            try:
+                self.repository.put_citation_links(
+                    cache_entry_id, request.workspace_id, request.project_id, doc_ids
+                )
+            except Exception:
+                logger.warning("write.citation_links_failed", entry_id=cache_entry_id)
+
+        stores: dict[str, str] = {"dynamodb": "ok"}
+
+        # Best-effort OpenSearch write
+        if self._semantic_available:
+            embedding = self.embedding_service.generate_embedding(normalized)
+            if embedding is not None:
+                settings = get_settings()
+                entry.query_embedding = embedding
+                entry.embedding_model = settings.embedding_model
+                success = self.opensearch_repo.index_embedding(
+                    cache_entry_id=cache_entry_id,
+                    query_embedding=embedding,
+                    query_normalized=normalized,
+                    application_id=self.repository.application_id,
+                    client_id=self.repository.client_id,
+                    workspace_id=request.workspace_id,
+                    project_id=request.project_id,
+                    expires_at=expires_at,
+                    created_at=now.isoformat(),
+                )
+                stores["opensearch"] = "ok" if success else "failed"
+            else:
+                stores["opensearch"] = "embedding_failed"
+
         return CacheWriteResponse(
             cache_entry_id=cache_entry_id,
             request_id=request.request_id,
             status="written",
-            stores={"dynamodb": "ok"},
+            stores=stores,
             expires_at=expires_at,
             created_at=now.isoformat(),
         )
@@ -158,7 +303,230 @@ class CacheService:
     ) -> CacheDeleteResponse:
         """Delete (invalidate) a cache entry."""
         self.repository.delete(cache_entry_id, workspace_id, project_id)
+
+        # Best-effort OpenSearch delete
+        if self.opensearch_repo is not None:
+            self.opensearch_repo.delete_entry(cache_entry_id)
+
         return CacheDeleteResponse(
             cache_entry_id=cache_entry_id,
             status="invalidated",
+        )
+
+    # -----------------------------------------------------------------
+    # Invalidation (Phase 3)
+    # -----------------------------------------------------------------
+
+    def invalidate(self, request: CacheInvalidateRequest) -> CacheInvalidateResponse:
+        """Invalidate cache entries matching criteria."""
+        now = datetime.now(UTC)
+        criteria = request.invalidation_criteria
+
+        # Use citation GSI for document-based invalidation
+        if criteria.cited_document_ids:
+            entries_to_invalidate = self._resolve_by_citation(
+                criteria.cited_document_ids, request.workspace_id, request.project_id
+            )
+        else:
+            entries_to_invalidate = self.repository.query_all_by_project(
+                request.workspace_id, request.project_id
+            )
+
+        # Apply remaining in-memory filters
+        filtered = self._apply_invalidation_filters(entries_to_invalidate, criteria)
+
+        count = self.repository.batch_invalidate(filtered)
+
+        # Best-effort OpenSearch cleanup
+        if self.opensearch_repo is not None:
+            for entry in filtered:
+                try:
+                    self.opensearch_repo.delete_entry(entry.cache_entry_id)
+                except Exception:
+                    logger.warning(
+                        "invalidate.opensearch_delete_failed",
+                        entry_id=entry.cache_entry_id,
+                    )
+
+        # Record audit event
+        event = InvalidationEventModel(
+            event_id=f"inv_{ulid.new().str}",
+            workspace_id=request.workspace_id,
+            project_id=request.project_id,
+            source="manual",
+            criteria=criteria.model_dump(exclude_none=True),
+            entries_affected=count,
+            triggered_by="api",
+            created_at=now.isoformat(),
+            ttl=int((now + timedelta(days=90)).timestamp()),
+        )
+        try:
+            self.repository.record_invalidation_event(event)
+        except Exception:
+            logger.warning("invalidate.audit_event_failed", event_id=event.event_id)
+
+        return CacheInvalidateResponse(
+            request_id=request.request_id,
+            entries_invalidated=count,
+            invalidation_criteria=criteria.model_dump(exclude_none=True),
+            created_at=now.isoformat(),
+        )
+
+    def _resolve_by_citation(
+        self, document_ids: list[str], workspace_id: str, project_id: str
+    ) -> list[CacheEntryModel]:
+        """Resolve cache entries by citation document IDs via GSI3."""
+        entry_ids: set[str] = set()
+        for doc_id in document_ids:
+            entry_ids.update(self.repository.query_by_citation(doc_id))
+
+        entries: list[CacheEntryModel] = []
+        for eid in entry_ids:
+            entry = self.repository.get_by_id(eid, workspace_id, project_id)
+            if entry is not None:
+                entries.append(entry)
+        return entries
+
+    def _apply_invalidation_filters(
+        self, entries: list[CacheEntryModel], criteria
+    ) -> list[CacheEntryModel]:
+        """Apply in-memory filters based on invalidation criteria."""
+        filtered = entries
+
+        if criteria.query_contains:
+            term = criteria.query_contains.lower()
+            filtered = [e for e in filtered if term in e.query_normalized.lower()]
+
+        if criteria.created_before:
+            cutoff = datetime.fromisoformat(criteria.created_before)
+            filtered = [e for e in filtered if datetime.fromisoformat(e.created_at) < cutoff]
+
+        return filtered
+
+    @staticmethod
+    def _extract_document_ids(citations: list[dict]) -> list[str]:
+        """Extract document_id values from citation dicts."""
+        doc_ids: list[str] = []
+        for c in citations:
+            doc_id = c.get("document_id") or c.get("documentId")
+            if doc_id:
+                doc_ids.append(doc_id)
+        return doc_ids
+
+    # -----------------------------------------------------------------
+    # Purge (Phase 3)
+    # -----------------------------------------------------------------
+
+    def purge(self, request: CachePurgeRequest) -> CachePurgeResponse:
+        """Purge cache entries for a scope."""
+        if not request.confirm:
+            raise PurgeRequiresConfirmError()
+
+        now = datetime.now(UTC)
+
+        if request.project_id:
+            entries = self.repository.query_all_by_project(request.workspace_id, request.project_id)
+        else:
+            entries = self.repository.query_all_by_workspace(request.workspace_id)
+
+        count = self.repository.batch_invalidate(entries)
+
+        # Best-effort OpenSearch cleanup
+        if self.opensearch_repo is not None:
+            try:
+                self.opensearch_repo.delete_by_query(
+                    application_id=self.repository.application_id,
+                    client_id=self.repository.client_id,
+                    workspace_id=request.workspace_id,
+                    project_id=request.project_id,
+                )
+            except Exception:
+                logger.warning("purge.opensearch_delete_failed")
+
+        scope: dict[str, str] = {"workspace_id": request.workspace_id}
+        if request.project_id:
+            scope["project_id"] = request.project_id
+
+        # Record audit event
+        event = InvalidationEventModel(
+            event_id=f"inv_{ulid.new().str}",
+            workspace_id=request.workspace_id,
+            project_id=request.project_id or "",
+            source="purge",
+            criteria=scope,
+            entries_affected=count,
+            triggered_by="api",
+            created_at=now.isoformat(),
+            ttl=int((now + timedelta(days=90)).timestamp()),
+        )
+        try:
+            self.repository.record_invalidation_event(event)
+        except Exception:
+            logger.warning("purge.audit_event_failed", event_id=event.event_id)
+
+        return CachePurgeResponse(
+            request_id=request.request_id,
+            entries_purged=count,
+            scope=scope,
+            created_at=now.isoformat(),
+        )
+
+    # -----------------------------------------------------------------
+    # Config (Phase 3)
+    # -----------------------------------------------------------------
+
+    def get_config(self, workspace_id: str, project_id: str) -> CacheConfigResponse:
+        """Get config for a project, returning defaults if none exists."""
+        model = self.repository.get_config(workspace_id, project_id)
+        if model is None:
+            return CacheConfigResponse(
+                workspace_id=workspace_id,
+                project_id=project_id,
+                config=CacheConfig(),
+            )
+
+        return CacheConfigResponse(
+            workspace_id=model.workspace_id,
+            project_id=model.project_id,
+            config=CacheConfig(
+                enabled=model.enabled,
+                default_ttl_seconds=model.default_ttl_seconds,
+                semantic_ttl_seconds=model.semantic_ttl_seconds,
+                similarity_threshold=model.similarity_threshold,
+                max_entry_size_bytes=model.max_entry_size_bytes,
+                event_driven_invalidation=model.event_driven_invalidation,
+                invalidation_events=model.invalidation_events,
+            ),
+            updated_at=model.updated_at,
+            updated_by=model.updated_by,
+        )
+
+    def put_config(
+        self, request: CacheConfigRequest, user_id: str | None = None
+    ) -> CacheConfigResponse:
+        """Write config for a project."""
+        now = datetime.now(UTC)
+
+        model = CacheConfigModel(
+            workspace_id=request.workspace_id,
+            project_id=request.project_id,
+            enabled=request.config.enabled,
+            default_ttl_seconds=request.config.default_ttl_seconds,
+            semantic_ttl_seconds=request.config.semantic_ttl_seconds,
+            similarity_threshold=request.config.similarity_threshold,
+            max_entry_size_bytes=request.config.max_entry_size_bytes,
+            event_driven_invalidation=request.config.event_driven_invalidation,
+            invalidation_events=request.config.invalidation_events,
+            updated_at=now.isoformat(),
+            updated_by=user_id,
+        )
+
+        self.repository.put_config(model)
+
+        return CacheConfigResponse(
+            workspace_id=request.workspace_id,
+            project_id=request.project_id,
+            config=request.config,
+            updated_at=now.isoformat(),
+            updated_by=user_id,
         )

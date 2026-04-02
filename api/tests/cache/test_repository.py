@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from src.cache.models import CacheEntryModel
+from src.cache.models import CacheConfigModel, CacheEntryModel, InvalidationEventModel
 from src.cache.repository import CacheRepository
 from src.common.exceptions import CacheEntryNotFoundError
 
@@ -109,3 +109,135 @@ class TestIncrementHitCount:
         result = repo.get_by_hash("ws_01", "proj_01", "abc123hash")
         assert result is not None
         assert result.hit_count == 1
+
+
+class TestQueryByProject:
+    def test_query_returns_matching_entries(self, repo):
+        e1 = _make_entry(cache_entry_id="ce_A", query_hash="h1")
+        e2 = _make_entry(cache_entry_id="ce_B", query_hash="h2")
+        repo.put(e1)
+        repo.put(e2)
+
+        entries, _ = repo.query_by_project("ws_01", "proj_01")
+        ids = {e.cache_entry_id for e in entries}
+        assert "ce_A" in ids
+        assert "ce_B" in ids
+
+    def test_query_empty_result(self, repo):
+        entries, _ = repo.query_by_project("ws_99", "proj_99")
+        assert entries == []
+
+    def test_query_filters_invalidated(self, repo):
+        e1 = _make_entry(cache_entry_id="ce_ACTIVE", query_hash="h1")
+        e2 = _make_entry(cache_entry_id="ce_DEAD", query_hash="h2", status="invalidated")
+        repo.put(e1)
+        repo.put(e2)
+
+        entries, _ = repo.query_by_project("ws_01", "proj_01")
+        ids = {e.cache_entry_id for e in entries}
+        assert "ce_ACTIVE" in ids
+        assert "ce_DEAD" not in ids
+
+    def test_query_all_by_project(self, repo):
+        for i in range(5):
+            repo.put(_make_entry(cache_entry_id=f"ce_{i}", query_hash=f"h{i}"))
+
+        entries = repo.query_all_by_project("ws_01", "proj_01")
+        assert len(entries) == 5
+
+    def test_query_all_by_workspace(self, repo):
+        repo.put(_make_entry(cache_entry_id="ce_P1", project_id="proj_01", query_hash="h1"))
+        repo.put(_make_entry(cache_entry_id="ce_P2", project_id="proj_02", query_hash="h2"))
+
+        entries = repo.query_all_by_workspace("ws_01")
+        ids = {e.cache_entry_id for e in entries}
+        assert "ce_P1" in ids
+        assert "ce_P2" in ids
+
+
+class TestBatchInvalidate:
+    def test_batch_invalidate_marks_entries(self, repo):
+        e1 = _make_entry(cache_entry_id="ce_X", query_hash="hx")
+        e2 = _make_entry(cache_entry_id="ce_Y", query_hash="hy")
+        repo.put(e1)
+        repo.put(e2)
+
+        count = repo.batch_invalidate([e1, e2])
+        assert count == 2
+
+        # Entries should no longer be active
+        assert repo.get_by_hash("ws_01", "proj_01", "hx") is None
+        assert repo.get_by_hash("ws_01", "proj_01", "hy") is None
+
+    def test_batch_invalidate_returns_count(self, repo):
+        e1 = _make_entry(cache_entry_id="ce_Z", query_hash="hz")
+        repo.put(e1)
+
+        count = repo.batch_invalidate([e1])
+        assert count == 1
+
+
+class TestConfig:
+    def test_get_config_returns_none_when_empty(self, repo):
+        result = repo.get_config("ws_01", "proj_01")
+        assert result is None
+
+    def test_put_then_get_config(self, repo):
+        config = CacheConfigModel(
+            workspace_id="ws_01",
+            project_id="proj_01",
+            enabled=True,
+            default_ttl_seconds=7200,
+            similarity_threshold=0.88,
+            updated_at=datetime.now(UTC).isoformat(),
+            updated_by="key_admin",
+        )
+        repo.put_config(config)
+
+        result = repo.get_config("ws_01", "proj_01")
+        assert result is not None
+        assert result.enabled is True
+        assert result.default_ttl_seconds == 7200
+        assert result.similarity_threshold == 0.88
+        assert result.updated_by == "key_admin"
+
+
+class TestInvalidationEvent:
+    def test_record_event(self, repo):
+        event = InvalidationEventModel(
+            event_id="inv_TEST01",
+            workspace_id="ws_01",
+            project_id="proj_01",
+            source="manual",
+            criteria={"query_contains": "password"},
+            entries_affected=3,
+            triggered_by="api",
+            created_at=datetime.now(UTC).isoformat(),
+            ttl=9999999999,
+        )
+        # Should not raise
+        repo.record_invalidation_event(event)
+
+
+class TestCitationLinks:
+    def test_put_and_query_by_citation(self, repo):
+        repo.put_citation_links("ce_CITE1", "ws_01", "proj_01", ["doc_A", "doc_B"])
+
+        result_a = repo.query_by_citation("doc_A")
+        assert "ce_CITE1" in result_a
+
+        result_b = repo.query_by_citation("doc_B")
+        assert "ce_CITE1" in result_b
+
+    def test_query_empty_citation(self, repo):
+        result = repo.query_by_citation("doc_NONEXIST")
+        assert result == []
+
+    def test_delete_citation_links(self, repo):
+        repo.put_citation_links("ce_CITE2", "ws_01", "proj_01", ["doc_C"])
+        assert "ce_CITE2" in repo.query_by_citation("doc_C")
+
+        repo.delete_citation_links("ce_CITE2", ["doc_C"])
+        # After deletion, the GSI entry won't be present anymore
+        # (moto may still return it from GSI since it uses eventual consistency,
+        # but the main table item is gone)

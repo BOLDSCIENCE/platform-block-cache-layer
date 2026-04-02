@@ -15,6 +15,8 @@ class LookupConfig(ApiModel):
     """Configuration for a cache lookup request."""
 
     enable_exact_match: bool = True
+    enable_semantic: bool = True
+    similarity_threshold: float = 0.92
     max_age_seconds: int | None = None
 
 
@@ -46,6 +48,8 @@ class LookupStages(ApiModel):
     """Timing breakdown of lookup pipeline stages."""
 
     exact_match_ms: float | None = None
+    embedding_ms: float | None = None
+    semantic_match_ms: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -115,3 +119,92 @@ class CacheDeleteResponse(ApiModel):
 
     cache_entry_id: str
     status: str = "invalidated"
+
+
+# ---------------------------------------------------------------------------
+# Invalidation
+# ---------------------------------------------------------------------------
+
+
+class InvalidationCriteria(ApiModel):
+    """Criteria for selecting cache entries to invalidate."""
+
+    query_contains: str | None = None
+    cited_document_ids: list[str] | None = None
+    created_before: str | None = None
+
+
+class CacheInvalidateRequest(ApiModel):
+    """POST /v1/cache/invalidate request body."""
+
+    workspace_id: str
+    project_id: str
+    invalidation_criteria: InvalidationCriteria
+    request_id: str | None = None
+
+
+class CacheInvalidateResponse(ApiModel):
+    """POST /v1/cache/invalidate response body."""
+
+    request_id: str | None = None
+    entries_invalidated: int
+    invalidation_criteria: dict[str, Any] = Field(default_factory=dict)
+    created_at: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Purge
+# ---------------------------------------------------------------------------
+
+
+class CachePurgeRequest(ApiModel):
+    """POST /v1/cache/purge request body."""
+
+    workspace_id: str
+    project_id: str | None = None
+    confirm: bool = False
+    request_id: str | None = None
+
+
+class CachePurgeResponse(ApiModel):
+    """POST /v1/cache/purge response body."""
+
+    request_id: str | None = None
+    entries_purged: int
+    scope: dict[str, str] = Field(default_factory=dict)
+    created_at: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+
+class CacheConfig(ApiModel):
+    """Cache configuration for a project."""
+
+    enabled: bool = True
+    default_ttl_seconds: int = 86400
+    semantic_ttl_seconds: int = 3600
+    similarity_threshold: float = 0.92
+    max_entry_size_bytes: int = 102400
+    event_driven_invalidation: bool = True
+    invalidation_events: list[str] = Field(default_factory=list)
+
+
+class CacheConfigRequest(ApiModel):
+    """PUT /v1/cache/config request body."""
+
+    workspace_id: str
+    project_id: str
+    config: CacheConfig
+
+
+class CacheConfigResponse(ApiModel):
+    """GET/PUT /v1/cache/config response body."""
+
+    workspace_id: str
+    project_id: str
+    config: CacheConfig
+    updated_at: str = ""
+    updated_by: str | None = None

@@ -60,3 +60,35 @@ def build_gsi_project_entries_pk(
     Format: APP#{application_id}#CLIENT#{client_id}#WS#{workspace_id}#PROJ#{project_id}
     """
     return f"APP#{application_id}#CLIENT#{client_id}#WS#{workspace_id}#PROJ#{project_id}"
+
+
+def build_config_sk(workspace_id: str, project_id: str) -> str:
+    """Build the DynamoDB sort key for a config entry.
+
+    Format: CONFIG#WS#{workspace_id}#PROJ#{project_id}
+    """
+    return f"CONFIG#WS#{workspace_id}#PROJ#{project_id}"
+
+
+def build_invalidation_sk(timestamp: str, event_id: str) -> str:
+    """Build the DynamoDB sort key for an invalidation event.
+
+    Format: INVAL#{timestamp}#{event_id}
+    """
+    return f"INVAL#{timestamp}#{event_id}"
+
+
+def build_gsi_citation_pk(application_id: str, client_id: str, document_id: str) -> str:
+    """Build GSI3 (Citation) partition key.
+
+    Format: APP#{application_id}#CLIENT#{client_id}#DOC#{document_id}
+    """
+    return f"APP#{application_id}#CLIENT#{client_id}#DOC#{document_id}"
+
+
+def build_citation_sk(document_id: str, cache_entry_id: str) -> str:
+    """Build the DynamoDB sort key for a citation link item.
+
+    Format: CITE#DOC#{document_id}#CACHE#{cache_entry_id}
+    """
+    return f"CITE#DOC#{document_id}#CACHE#{cache_entry_id}"

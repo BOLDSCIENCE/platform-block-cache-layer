@@ -43,3 +43,9 @@ def require_write(auth: AuthContext) -> AuthContext:
     """Require cache:write scope."""
     require_scope(auth, "cache:write")
     return auth
+
+
+def require_admin(auth: AuthContext) -> AuthContext:
+    """Require cache:admin scope."""
+    require_scope(auth, "cache:admin")
+    return auth

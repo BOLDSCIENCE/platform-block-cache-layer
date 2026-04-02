@@ -50,6 +50,15 @@ data "aws_ssm_parameter" "dns_wildcard_cert_arn" {
   name  = "/bold/dns/${var.environment}/wildcard-cert-arn"
 }
 
+data "aws_ssm_parameter" "model_gateway_api_url" {
+  name = "/bold/model-gateway/api-url"
+}
+
+data "aws_ssm_parameter" "model_gateway_api_key" {
+  name            = "/bold/model-gateway/api-key"
+  with_decryption = true
+}
+
 # -----------------------------------------------------------------------------
 # Locals
 # -----------------------------------------------------------------------------

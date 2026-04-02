@@ -24,6 +24,15 @@ class Settings(BaseSettings):
     environment: str = "development"
     api_version: str = "v1"
 
+    # Semantic similarity settings (Phase 2)
+    opensearch_endpoint: str | None = None
+    opensearch_index: str = "bold-semantic-cache"
+    model_gateway_api_url: str | None = None
+    model_gateway_api_key: str | None = None
+    embedding_model: str = "amazon.titan-embed-text-v2:0"
+    embedding_dimensions: int = 1024
+    default_similarity_threshold: float = 0.92
+
 
 @lru_cache
 def get_settings() -> Settings:
