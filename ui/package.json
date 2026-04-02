@@ -28,6 +28,9 @@
     "zod": "^3.0.0",
     "tailwindcss": "^4.0.0"
   },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
   "devDependencies": {
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
