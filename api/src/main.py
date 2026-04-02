@@ -56,7 +56,7 @@ app = FastAPI(
     description="Intelligent response caching for AI applications. "
     "Provides exact match and semantic similarity caching with "
     "lookup-or-exec cache-aside pattern, statistics, and cost savings tracking.",
-    version="0.4.0",
+    version="0.5.0",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -162,7 +162,7 @@ def get_root() -> dict[str, str]:
     """Root endpoint."""
     return {
         "service": settings.service_name,
-        "version": "0.4.0",
+        "version": "0.5.0",
     }
 
 

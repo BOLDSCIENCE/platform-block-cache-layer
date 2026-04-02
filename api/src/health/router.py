@@ -60,7 +60,7 @@ def _check_health() -> dict[str, Any]:
     result = {
         "status": status,
         "service": "cache-layer-api",
-        "version": "0.1.0",
+        "version": "0.5.0",
         "dependencies": {
             "dynamodb": db_status,
             "opensearch": os_status,
