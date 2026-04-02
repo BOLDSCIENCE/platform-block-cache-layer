@@ -1,15 +1,11 @@
 """Tests for SDK Pydantic types."""
 
 from boldsci_cache_layer.types import (
-    CacheConfig,
     CacheConfigResponse,
     CacheLookupResponse,
-    CacheStatsDetail,
     CacheStatsResponse,
     CacheWriteResponse,
-    CachedResponse,
     LookupOrExecResponse,
-    TokensSaved,
 )
 
 
@@ -19,7 +15,11 @@ class TestCamelCaseAliases:
             "status": "hit",
             "source": "exact",
             "cacheEntryId": "entry_123",
-            "response": {"content": "Hello", "model": "gpt-4o", "tokensUsed": {"input": 5, "output": 10}},
+            "response": {
+                "content": "Hello",
+                "model": "gpt-4o",
+                "tokensUsed": {"input": 5, "output": 10},
+            },
             "similarityScore": 1.0,
             "matchedQuery": "hello",
             "cacheMetadata": {"createdAt": "2026-01-01T00:00:00Z", "hitCount": 3},

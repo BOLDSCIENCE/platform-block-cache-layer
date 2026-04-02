@@ -28,9 +28,7 @@ class TestEnvelopeUnwrap:
 
     @respx.mock
     def test_returns_body_without_envelope(self):
-        respx.get(f"{API_URL}/v1/raw").mock(
-            return_value=httpx.Response(200, json={"raw": True})
-        )
+        respx.get(f"{API_URL}/v1/raw").mock(return_value=httpx.Response(200, json={"raw": True}))
         client = BaseClient(api_url=API_URL, api_key=API_KEY, max_retries=0)
         result = client._request("GET", "/v1/raw")
         assert result == {"raw": True}
@@ -38,9 +36,7 @@ class TestEnvelopeUnwrap:
 
     @respx.mock
     def test_handles_204_no_content(self):
-        respx.delete(f"{API_URL}/v1/cache/entries/x").mock(
-            return_value=httpx.Response(204)
-        )
+        respx.delete(f"{API_URL}/v1/cache/entries/x").mock(return_value=httpx.Response(204))
         client = BaseClient(api_url=API_URL, api_key=API_KEY, max_retries=0)
         result = client._request("DELETE", "/v1/cache/entries/x")
         assert result is None
@@ -84,7 +80,9 @@ class TestErrorParsing:
     @respx.mock
     def test_500_raises_api_error(self):
         respx.get(f"{API_URL}/v1/health").mock(
-            return_value=httpx.Response(500, json={"error": {"code": "INTERNAL", "message": "Boom"}})
+            return_value=httpx.Response(
+                500, json={"error": {"code": "INTERNAL", "message": "Boom"}}
+            )
         )
         client = BaseClient(api_url=API_URL, api_key=API_KEY, max_retries=0)
         try:

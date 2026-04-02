@@ -32,7 +32,15 @@ class TestExceptionHierarchy:
         assert "TEST" in repr(err)
 
     def test_all_subclasses_inherit(self):
-        for cls in [APIError, AuthenticationError, ForbiddenError, NotFoundError, ValidationError, RateLimitError, NetworkError]:
+        for cls in [
+            APIError,
+            AuthenticationError,
+            ForbiddenError,
+            NotFoundError,
+            ValidationError,
+            RateLimitError,
+            NetworkError,
+        ]:
             err = cls(message="test")
             assert isinstance(err, CacheLayerError)
 
