@@ -4,7 +4,10 @@ from src.cache.normalizer import (
     build_cache_sk,
     build_gsi_project_entries_pk,
     build_gsi_query_hash_pk,
+    build_gsi_stats_pk,
     build_pk,
+    build_stats_live_sk,
+    build_stats_period_sk,
     compute_query_hash,
     normalize_query,
 )
@@ -86,3 +89,17 @@ class TestBuildGsiQueryHashPkWithContext:
     def test_with_none_context_hash(self):
         result = build_gsi_query_hash_pk("app1", "client1", "abc123", context_hash=None)
         assert result == "APP#app1#CLIENT#client1#HASH#abc123"
+
+
+class TestStatsKeyBuilders:
+    def test_build_stats_live_sk(self):
+        result = build_stats_live_sk("ws_01", "proj_01", "2026-04-01T14:15")
+        assert result == "STATS_LIVE#WS#ws_01#PROJ#proj_01#BUCKET#2026-04-01T14:15"
+
+    def test_build_stats_period_sk(self):
+        result = build_stats_period_sk("24h", "2026-04-01T14:00")
+        assert result == "STATS#24h#2026-04-01T14:00"
+
+    def test_build_gsi_stats_pk(self):
+        result = build_gsi_stats_pk("app1", "client1", "ws_01", "proj_01")
+        assert result == "APP#app1#CLIENT#client1#WS#ws_01#PROJ#proj_01"

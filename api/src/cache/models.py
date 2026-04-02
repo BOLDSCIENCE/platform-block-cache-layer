@@ -62,3 +62,39 @@ class InvalidationEventModel:
     triggered_by: str = ""
     created_at: str = ""
     ttl: int = 0  # 90-day retention
+
+
+@dataclass
+class StatsLiveBucketModel:
+    """Live stats bucket — atomic counters incremented on each lookup."""
+
+    workspace_id: str
+    project_id: str
+    bucket: str  # 15-min bucket key, e.g. "2026-04-01T14:15"
+    exact_hits: int = 0
+    semantic_hits: int = 0
+    misses: int = 0
+    tokens_saved_input: int = 0
+    tokens_saved_output: int = 0
+
+
+@dataclass
+class StatsPeriodModel:
+    """Pre-aggregated stats for a time period."""
+
+    workspace_id: str
+    project_id: str
+    period: str  # "1h", "24h", "7d", "30d"
+    timestamp: str  # ISO format of the period end
+    exact_hits: int = 0
+    semantic_hits: int = 0
+    misses: int = 0
+    total_lookups: int = 0
+    hit_rate: float = 0.0
+    exact_hit_rate: float = 0.0
+    semantic_hit_rate: float = 0.0
+    tokens_saved_input: int = 0
+    tokens_saved_output: int = 0
+    estimated_cost_saved_usd: float = 0.0
+    total_entries: int = 0
+    ttl: int = 0

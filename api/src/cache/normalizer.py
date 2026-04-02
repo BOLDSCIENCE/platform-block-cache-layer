@@ -98,3 +98,29 @@ def build_citation_sk(document_id: str, cache_entry_id: str) -> str:
     Format: CITE#DOC#{document_id}#CACHE#{cache_entry_id}
     """
     return f"CITE#DOC#{document_id}#CACHE#{cache_entry_id}"
+
+
+def build_stats_live_sk(workspace_id: str, project_id: str, bucket: str) -> str:
+    """Build SK for a live stats bucket.
+
+    Format: STATS_LIVE#WS#{workspace_id}#PROJ#{project_id}#BUCKET#{bucket}
+    """
+    return f"STATS_LIVE#WS#{workspace_id}#PROJ#{project_id}#BUCKET#{bucket}"
+
+
+def build_stats_period_sk(period: str, timestamp: str) -> str:
+    """Build SK for a pre-aggregated stats period item.
+
+    Format: STATS#{period}#{timestamp}
+    """
+    return f"STATS#{period}#{timestamp}"
+
+
+def build_gsi_stats_pk(
+    application_id: str, client_id: str, workspace_id: str, project_id: str
+) -> str:
+    """Build GSI4 (Stats) partition key.
+
+    Format: APP#{application_id}#CLIENT#{client_id}#WS#{workspace_id}#PROJ#{project_id}
+    """
+    return f"APP#{application_id}#CLIENT#{client_id}#WS#{workspace_id}#PROJ#{project_id}"
