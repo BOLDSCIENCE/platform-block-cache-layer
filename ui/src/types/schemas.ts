@@ -4,106 +4,106 @@ import { z } from "zod";
 
 export const cachedResponseSchema = z.object({
   content: z.string(),
-  model: z.string().default(""),
-  tokensUsed: z.record(z.number()).default({}),
-  citations: z.array(z.record(z.unknown())).default([]),
+  model: z.string(),
+  tokensUsed: z.record(z.number()),
+  citations: z.array(z.record(z.unknown())),
 });
 
 export const cacheMetadataSchema = z.object({
   createdAt: z.string(),
   hitCount: z.number(),
-  lastHitAt: z.string().nullable().default(null),
-  ttlRemainingSeconds: z.number().nullable().default(null),
+  lastHitAt: z.string().nullable(),
+  ttlRemainingSeconds: z.number().nullable(),
 });
 
 export const lookupStagesSchema = z.object({
-  exactMatchMs: z.number().nullable().default(null),
-  embeddingMs: z.number().nullable().default(null),
-  semanticMatchMs: z.number().nullable().default(null),
+  exactMatchMs: z.number().nullable(),
+  embeddingMs: z.number().nullable(),
+  semanticMatchMs: z.number().nullable(),
 });
 
 // --- Lookup ---
 
 export const cacheLookupResponseSchema = z.object({
-  requestId: z.string().nullable().default(null),
+  requestId: z.string().nullable(),
   status: z.string(),
-  source: z.string().nullable().default(null),
-  cacheEntryId: z.string().nullable().default(null),
-  response: cachedResponseSchema.nullable().default(null),
-  similarityScore: z.number().nullable().default(null),
-  matchedQuery: z.string().nullable().default(null),
-  cacheMetadata: cacheMetadataSchema.nullable().default(null),
-  lookupLatencyMs: z.number().default(0),
-  stages: lookupStagesSchema.nullable().default(null),
+  source: z.string().nullable(),
+  cacheEntryId: z.string().nullable(),
+  response: cachedResponseSchema.nullable(),
+  similarityScore: z.number().nullable(),
+  matchedQuery: z.string().nullable(),
+  cacheMetadata: cacheMetadataSchema.nullable(),
+  lookupLatencyMs: z.number(),
+  stages: lookupStagesSchema.nullable(),
 });
 
 // --- Write ---
 
 export const cacheWriteResponseSchema = z.object({
   cacheEntryId: z.string(),
-  requestId: z.string().nullable().default(null),
-  status: z.string().default("written"),
-  stores: z.record(z.string()).default({}),
-  expiresAt: z.string().nullable().default(null),
-  createdAt: z.string().default(""),
+  requestId: z.string().nullable(),
+  status: z.string(),
+  stores: z.record(z.string()),
+  expiresAt: z.string().nullable(),
+  createdAt: z.string(),
 });
 
 // --- Invalidation ---
 
 export const cacheInvalidateResponseSchema = z.object({
-  requestId: z.string().nullable().default(null),
+  requestId: z.string().nullable(),
   entriesInvalidated: z.number(),
-  invalidationCriteria: z.record(z.unknown()).default({}),
-  createdAt: z.string().default(""),
+  invalidationCriteria: z.record(z.unknown()),
+  createdAt: z.string(),
 });
 
 // --- Purge ---
 
 export const cachePurgeResponseSchema = z.object({
-  requestId: z.string().nullable().default(null),
+  requestId: z.string().nullable(),
   entriesPurged: z.number(),
-  scope: z.record(z.string()).default({}),
-  createdAt: z.string().default(""),
+  scope: z.record(z.string()),
+  createdAt: z.string(),
 });
 
 // --- Config ---
 
 export const cacheConfigSchema = z.object({
-  enabled: z.boolean().default(true),
-  defaultTtlSeconds: z.number().default(86400),
-  semanticTtlSeconds: z.number().default(3600),
-  similarityThreshold: z.number().default(0.92),
-  maxEntrySizeBytes: z.number().default(102400),
-  eventDrivenInvalidation: z.boolean().default(true),
-  invalidationEvents: z.array(z.string()).default([]),
+  enabled: z.boolean(),
+  defaultTtlSeconds: z.number(),
+  semanticTtlSeconds: z.number(),
+  similarityThreshold: z.number(),
+  maxEntrySizeBytes: z.number(),
+  eventDrivenInvalidation: z.boolean(),
+  invalidationEvents: z.array(z.string()),
 });
 
 export const cacheConfigResponseSchema = z.object({
   workspaceId: z.string(),
   projectId: z.string(),
   config: cacheConfigSchema,
-  updatedAt: z.string().default(""),
-  updatedBy: z.string().nullable().default(null),
+  updatedAt: z.string(),
+  updatedBy: z.string().nullable(),
 });
 
 // --- Stats ---
 
 export const tokensSavedSchema = z.object({
-  input: z.number().default(0),
-  output: z.number().default(0),
+  input: z.number(),
+  output: z.number(),
 });
 
 export const cacheStatsDetailSchema = z.object({
-  totalLookups: z.number().default(0),
-  exactHits: z.number().default(0),
-  semanticHits: z.number().default(0),
-  misses: z.number().default(0),
-  hitRate: z.number().default(0),
-  exactHitRate: z.number().default(0),
-  semanticHitRate: z.number().default(0),
-  totalEntries: z.number().default(0),
-  estimatedCostSavedUsd: z.number().default(0),
-  estimatedTokensSaved: tokensSavedSchema.default({}),
+  totalLookups: z.number(),
+  exactHits: z.number(),
+  semanticHits: z.number(),
+  misses: z.number(),
+  hitRate: z.number(),
+  exactHitRate: z.number(),
+  semanticHitRate: z.number(),
+  totalEntries: z.number(),
+  estimatedCostSavedUsd: z.number(),
+  estimatedTokensSaved: tokensSavedSchema,
 });
 
 export const cacheStatsResponseSchema = z.object({
@@ -117,7 +117,7 @@ export const cacheStatsResponseSchema = z.object({
 
 export const cacheDeleteResponseSchema = z.object({
   cacheEntryId: z.string(),
-  status: z.string().default("invalidated"),
+  status: z.string(),
 });
 
 // --- Inferred types ---
