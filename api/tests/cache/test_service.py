@@ -774,3 +774,100 @@ class TestContextAwareLookup:
         result = cache_service.lookup(lookup)
         assert result.status == "hit"
         assert result.response.content == "answer"
+
+
+class TestGetStats:
+    """Tests for GET /v1/cache/stats."""
+
+    def test_get_stats_returns_defaults_when_no_data(self, cache_service):
+        """Returns zeroed stats when no data exists."""
+        result = cache_service.get_stats("ws_01", "proj_01", "24h")
+        assert result.period == "24h"
+        assert result.stats.total_lookups == 0
+        assert result.stats.hit_rate == 0.0
+        assert result.stats.estimated_cost_saved_usd == 0.0
+
+    def test_get_stats_returns_aggregated_data(self, cache_service):
+        """Returns pre-aggregated stats when data exists."""
+        from src.cache.models import StatsPeriodModel
+
+        period = StatsPeriodModel(
+            workspace_id="ws_01",
+            project_id="proj_01",
+            period="24h",
+            timestamp="2026-04-01T14:00",
+            exact_hits=100,
+            semantic_hits=30,
+            misses=50,
+            total_lookups=180,
+            hit_rate=0.722,
+            exact_hit_rate=0.556,
+            semantic_hit_rate=0.167,
+            tokens_saved_input=50000,
+            tokens_saved_output=30000,
+            estimated_cost_saved_usd=1.23,
+            total_entries=42,
+            ttl=9999999999,
+        )
+        cache_service.repository.put_stats_period(period)
+
+        result = cache_service.get_stats("ws_01", "proj_01", "24h")
+        assert result.stats.total_lookups == 180
+        assert result.stats.hit_rate == 0.722
+        assert result.stats.estimated_cost_saved_usd == 1.23
+        assert result.stats.estimated_tokens_saved.input == 50000
+
+
+class TestStatsIncrement:
+    """Tests for stats counter increment during lookup."""
+
+    def test_exact_hit_increments_stats(self, cache_service):
+        """An exact hit increments the exact_hits counter."""
+        from src.cache.schemas import CachedResponse, CacheLookupRequest, CacheWriteRequest
+
+        # Write an entry
+        write_req = CacheWriteRequest(
+            workspace_id="ws_01",
+            project_id="proj_01",
+            query="stats test query?",
+            response=CachedResponse(
+                content="answer",
+                model="test-model",
+                tokens_used={"input": 100, "output": 50},
+            ),
+        )
+        cache_service.write(write_req)
+
+        # Lookup triggers stats increment
+        lookup_req = CacheLookupRequest(
+            workspace_id="ws_01",
+            project_id="proj_01",
+            query="stats test query?",
+        )
+        result = cache_service.lookup(lookup_req)
+        assert result.status == "hit"
+
+        # Verify stats bucket was incremented
+        buckets = cache_service.repository.query_stats_live_buckets("ws_01", "proj_01")
+        assert len(buckets) >= 1
+        bucket = buckets[0]
+        assert int(bucket.get("exact_hits", 0)) == 1
+        assert int(bucket.get("tokens_saved_input", 0)) == 100
+        assert int(bucket.get("tokens_saved_output", 0)) == 50
+
+    def test_miss_increments_stats(self, cache_service):
+        """A miss increments the misses counter."""
+        from src.cache.schemas import CacheLookupRequest
+
+        lookup_req = CacheLookupRequest(
+            workspace_id="ws_01",
+            project_id="proj_01",
+            query="nonexistent query?",
+        )
+        result = cache_service.lookup(lookup_req)
+        assert result.status == "miss"
+
+        buckets = cache_service.repository.query_stats_live_buckets("ws_01", "proj_01")
+        assert len(buckets) >= 1
+        bucket = buckets[0]
+        assert int(bucket.get("misses", 0)) == 1

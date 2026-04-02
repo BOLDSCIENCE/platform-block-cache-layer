@@ -15,6 +15,7 @@ from src.cache.schemas import (
     CacheLookupResponse,
     CachePurgeRequest,
     CachePurgeResponse,
+    CacheStatsResponse,
     CacheWriteRequest,
     CacheWriteResponse,
 )
@@ -100,3 +101,16 @@ def cache_config_put(
     """Update cache configuration for a project."""
     require_admin(auth)
     return service.put_config(body, user_id=auth.key_id)
+
+
+@router.get("/stats", response_model=CacheStatsResponse)
+def cache_stats(
+    auth: Auth,
+    service: CacheServiceDep,
+    workspace_id: str = Query(..., description="Workspace ID"),
+    project_id: str = Query(..., description="Project ID"),
+    period: str = Query("24h", description="Stats period: 1h, 24h, 7d, 30d"),
+) -> CacheStatsResponse:
+    """Get cache statistics for a scope."""
+    require_read(auth)
+    return service.get_stats(workspace_id, project_id, period)

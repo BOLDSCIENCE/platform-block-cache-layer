@@ -29,6 +29,7 @@ from src.cache.schemas import (
     CacheMetadata,
     CachePurgeRequest,
     CachePurgeResponse,
+    CacheStatsResponse,
     CacheWriteRequest,
     CacheWriteResponse,
     LookupStages,
@@ -80,6 +81,7 @@ class CacheService:
                 created = datetime.fromisoformat(entry.created_at)
                 age = (datetime.now(UTC) - created).total_seconds()
                 if age > request.lookup_config.max_age_seconds:
+                    self._increment_stats(request.workspace_id, request.project_id, "misses")
                     total_ms = (time.monotonic() - start) * 1000
                     return CacheLookupResponse(
                         request_id=request.request_id,
@@ -125,6 +127,9 @@ class CacheService:
                             created = datetime.fromisoformat(entry.created_at)
                             age = (datetime.now(UTC) - created).total_seconds()
                             if age > request.lookup_config.max_age_seconds:
+                                self._increment_stats(
+                                    request.workspace_id, request.project_id, "misses"
+                                )
                                 total_ms = (time.monotonic() - start) * 1000
                                 return CacheLookupResponse(
                                     request_id=request.request_id,
@@ -154,6 +159,7 @@ class CacheService:
                         )
 
         # --- Miss ---
+        self._increment_stats(request.workspace_id, request.project_id, "misses")
         total_ms = (time.monotonic() - start) * 1000
         return CacheLookupResponse(
             request_id=request.request_id,
@@ -186,6 +192,14 @@ class CacheService:
             self.repository.increment_hit_count(pk, sk, now)
         except Exception:
             logger.warning("Failed to increment hit count", entry_id=entry.cache_entry_id)
+
+        self._increment_stats(
+            entry.workspace_id,
+            entry.project_id,
+            f"{source}_hits",
+            tokens_input=entry.tokens_used.get("input", 0),
+            tokens_output=entry.tokens_used.get("output", 0),
+        )
 
         total_ms = (time.monotonic() - start) * 1000
         ttl_remaining = None
@@ -531,3 +545,62 @@ class CacheService:
             updated_at=now.isoformat(),
             updated_by=user_id,
         )
+
+    # -----------------------------------------------------------------
+    # Stats (Phase 4)
+    # -----------------------------------------------------------------
+
+    def get_stats(
+        self, workspace_id: str, project_id: str, period: str = "24h"
+    ) -> CacheStatsResponse:
+        """Get pre-aggregated stats for a scope and period."""
+        from src.cache.schemas import CacheStatsDetail, CacheStatsResponse, TokensSaved
+
+        result = self.repository.query_stats_period(workspace_id, project_id, period)
+
+        if result is None:
+            return CacheStatsResponse(
+                workspace_id=workspace_id,
+                project_id=project_id,
+                period=period,
+                stats=CacheStatsDetail(),
+            )
+
+        return CacheStatsResponse(
+            workspace_id=workspace_id,
+            project_id=project_id,
+            period=period,
+            stats=CacheStatsDetail(
+                total_lookups=result.total_lookups,
+                exact_hits=result.exact_hits,
+                semantic_hits=result.semantic_hits,
+                misses=result.misses,
+                hit_rate=result.hit_rate,
+                exact_hit_rate=result.exact_hit_rate,
+                semantic_hit_rate=result.semantic_hit_rate,
+                total_entries=result.total_entries,
+                estimated_cost_saved_usd=result.estimated_cost_saved_usd,
+                estimated_tokens_saved=TokensSaved(
+                    input=result.tokens_saved_input,
+                    output=result.tokens_saved_output,
+                ),
+            ),
+        )
+
+    def _increment_stats(
+        self,
+        workspace_id: str,
+        project_id: str,
+        hit_type: str,
+        tokens_input: int = 0,
+        tokens_output: int = 0,
+    ) -> None:
+        """Best-effort increment of the live stats bucket."""
+        now = datetime.now(UTC)
+        bucket = now.strftime("%Y-%m-%dT%H:") + f"{(now.minute // 15) * 15:02d}"
+        try:
+            self.repository.increment_stats_bucket(
+                workspace_id, project_id, bucket, hit_type, tokens_input, tokens_output
+            )
+        except Exception:
+            logger.warning("stats.increment_failed", hit_type=hit_type)

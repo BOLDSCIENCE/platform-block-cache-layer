@@ -210,3 +210,39 @@ class CacheConfigResponse(ApiModel):
     config: CacheConfig
     updated_at: str = ""
     updated_by: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Stats
+# ---------------------------------------------------------------------------
+
+
+class TokensSaved(ApiModel):
+    """Token counts saved by cache hits."""
+
+    input: int = 0
+    output: int = 0
+
+
+class CacheStatsDetail(ApiModel):
+    """Detailed cache statistics for a period."""
+
+    total_lookups: int = 0
+    exact_hits: int = 0
+    semantic_hits: int = 0
+    misses: int = 0
+    hit_rate: float = 0.0
+    exact_hit_rate: float = 0.0
+    semantic_hit_rate: float = 0.0
+    total_entries: int = 0
+    estimated_cost_saved_usd: float = 0.0
+    estimated_tokens_saved: TokensSaved = Field(default_factory=TokensSaved)
+
+
+class CacheStatsResponse(ApiModel):
+    """GET /v1/cache/stats response body."""
+
+    workspace_id: str
+    project_id: str
+    period: str
+    stats: CacheStatsDetail

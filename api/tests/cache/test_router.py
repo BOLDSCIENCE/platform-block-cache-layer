@@ -386,3 +386,31 @@ class TestResponseEnvelope:
         assert "meta" in body
         assert "timestamp" in body["meta"]
         assert "requestId" in body["meta"]
+
+
+class TestCacheStats:
+    def test_get_stats_returns_defaults(self, client):
+        response = client.get(
+            "/v1/cache/stats",
+            params={"workspace_id": "ws_01", "project_id": "proj_01"},
+        )
+        assert response.status_code == 200
+        data = unwrap(response)
+        assert data["period"] == "24h"
+        assert data["stats"]["totalLookups"] == 0
+
+    def test_get_stats_with_period(self, client):
+        response = client.get(
+            "/v1/cache/stats",
+            params={"workspace_id": "ws_01", "project_id": "proj_01", "period": "7d"},
+        )
+        assert response.status_code == 200
+        data = unwrap(response)
+        assert data["period"] == "7d"
+
+    def test_get_stats_requires_auth(self, unauth_client):
+        response = unauth_client.get(
+            "/v1/cache/stats",
+            params={"workspace_id": "ws_01", "project_id": "proj_01"},
+        )
+        assert response.status_code == 401
