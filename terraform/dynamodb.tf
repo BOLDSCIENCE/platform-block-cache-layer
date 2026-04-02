@@ -52,6 +52,17 @@ resource "aws_dynamodb_table" "main" {
     type = "S"
   }
 
+  # GSI4: Stats — pre-aggregated cache statistics
+  attribute {
+    name = "GSI4PK"
+    type = "S"
+  }
+
+  attribute {
+    name = "GSI4SK"
+    type = "S"
+  }
+
   global_secondary_index {
     name            = "GSI1"
     hash_key        = "GSI1PK"
@@ -71,6 +82,13 @@ resource "aws_dynamodb_table" "main" {
     hash_key        = "GSI3PK"
     range_key       = "GSI3SK"
     projection_type = "KEYS_ONLY"
+  }
+
+  global_secondary_index {
+    name            = "GSI4"
+    hash_key        = "GSI4PK"
+    range_key       = "GSI4SK"
+    projection_type = "ALL"
   }
 
   ttl {

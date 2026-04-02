@@ -83,3 +83,28 @@ variable "opensearch_ebs_volume_size" {
   description = "EBS volume size in GB for OpenSearch nodes"
   default     = 20
 }
+
+# Stats aggregator Lambda variables
+variable "stats_aggregator_lambda_memory_size" {
+  type        = number
+  description = "Memory size for the Stats Aggregator Lambda (MB)"
+  default     = 256
+}
+
+variable "stats_aggregator_lambda_timeout" {
+  type        = number
+  description = "Timeout for the Stats Aggregator Lambda (seconds)"
+  default     = 120
+}
+
+variable "application_id" {
+  type        = string
+  description = "Application ID for the cache layer tenant"
+  default     = ""
+}
+
+variable "client_id" {
+  type        = string
+  description = "Client ID for the cache layer tenant"
+  default     = ""
+}

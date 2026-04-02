@@ -250,3 +250,124 @@ resource "aws_iam_role" "event_handler_lambda" {
     Name = "${local.name_prefix}-event-handler-lambda"
   }
 }
+
+# -----------------------------------------------------------------------------
+# Stats Aggregator Lambda — periodic stats rollup (every 15 minutes)
+# -----------------------------------------------------------------------------
+
+resource "aws_cloudwatch_log_group" "stats_aggregator" {
+  name              = "/aws/lambda/${local.name_prefix}-stats-aggregator"
+  retention_in_days = var.log_retention_days
+
+  tags = {
+    Name = "${local.name_prefix}-stats-aggregator-logs"
+  }
+}
+
+resource "aws_lambda_function" "stats_aggregator" {
+  function_name = "${local.name_prefix}-stats-aggregator"
+  role          = aws_iam_role.stats_aggregator_lambda.arn
+  handler       = "src.stats_aggregator.handler"
+  runtime       = "python3.12"
+  architectures = ["arm64"]
+  memory_size   = var.stats_aggregator_lambda_memory_size
+  timeout       = var.stats_aggregator_lambda_timeout
+
+  filename         = var.api_lambda_zip_path
+  source_code_hash = filebase64sha256(var.api_lambda_zip_path)
+
+  layers = [
+    "arn:aws:lambda:${local.region}:901920570463:layer:aws-otel-python-arm64-ver-1-25-0:1",
+  ]
+
+  tracing_config {
+    mode = "Active"
+  }
+
+  environment {
+    variables = {
+      DYNAMODB_TABLE = aws_dynamodb_table.main.name
+      AWS_REGION_NAME = local.region
+      ENVIRONMENT    = var.environment
+      LOG_LEVEL      = var.log_level
+      APPLICATION_ID = var.application_id
+      CLIENT_ID      = var.client_id
+    }
+  }
+
+  depends_on = [aws_cloudwatch_log_group.stats_aggregator]
+
+  tags = {
+    Name = "${local.name_prefix}-stats-aggregator"
+  }
+}
+
+# -----------------------------------------------------------------------------
+# IAM role for Stats Aggregator Lambda
+# -----------------------------------------------------------------------------
+
+resource "aws_iam_role" "stats_aggregator_lambda" {
+  name = "${local.name_prefix}-stats-aggregator-lambda"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Service = "lambda.amazonaws.com"
+        }
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+
+  inline_policy {
+    name = "stats-aggregator-lambda-policy"
+    policy = jsonencode({
+      Version = "2012-10-17"
+      Statement = [
+        {
+          Sid    = "CloudWatchLogs"
+          Effect = "Allow"
+          Action = [
+            "logs:CreateLogGroup",
+            "logs:CreateLogStream",
+            "logs:PutLogEvents",
+          ]
+          Resource = "${aws_cloudwatch_log_group.stats_aggregator.arn}:*"
+        },
+        {
+          Sid    = "DynamoDB"
+          Effect = "Allow"
+          Action = [
+            "dynamodb:GetItem",
+            "dynamodb:PutItem",
+            "dynamodb:UpdateItem",
+            "dynamodb:Query",
+            "dynamodb:Scan",
+          ]
+          Resource = [
+            aws_dynamodb_table.main.arn,
+            "${aws_dynamodb_table.main.arn}/index/*",
+          ]
+        },
+        {
+          Sid    = "XRay"
+          Effect = "Allow"
+          Action = [
+            "xray:PutTraceSegments",
+            "xray:PutTelemetryRecords",
+            "xray:GetSamplingRules",
+            "xray:GetSamplingTargets",
+          ]
+          Resource = "*"
+        },
+      ]
+    })
+  }
+
+  tags = {
+    Name = "${local.name_prefix}-stats-aggregator-lambda"
+  }
+}
