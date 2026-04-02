@@ -56,6 +56,8 @@ def dynamodb_tables():
                 {"AttributeName": "GSI2SK", "AttributeType": "S"},
                 {"AttributeName": "GSI3PK", "AttributeType": "S"},
                 {"AttributeName": "GSI3SK", "AttributeType": "S"},
+                {"AttributeName": "GSI4PK", "AttributeType": "S"},
+                {"AttributeName": "GSI4SK", "AttributeType": "S"},
             ],
             GlobalSecondaryIndexes=[
                 {
@@ -81,6 +83,14 @@ def dynamodb_tables():
                         {"AttributeName": "GSI3SK", "KeyType": "RANGE"},
                     ],
                     "Projection": {"ProjectionType": "KEYS_ONLY"},
+                },
+                {
+                    "IndexName": "GSI4",
+                    "KeySchema": [
+                        {"AttributeName": "GSI4PK", "KeyType": "HASH"},
+                        {"AttributeName": "GSI4SK", "KeyType": "RANGE"},
+                    ],
+                    "Projection": {"ProjectionType": "ALL"},
                 },
             ],
             BillingMode="PAY_PER_REQUEST",

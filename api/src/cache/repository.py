@@ -1,11 +1,15 @@
 """DynamoDB operations for cache entries."""
 
-from typing import Any
+import time
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from boto3.dynamodb.conditions import Key
 
 from src.cache.models import CacheConfigModel, CacheEntryModel, InvalidationEventModel
+
+if TYPE_CHECKING:
+    from src.cache.models import StatsPeriodModel
 from src.cache.normalizer import (
     build_cache_sk,
     build_citation_sk,
@@ -13,8 +17,11 @@ from src.cache.normalizer import (
     build_gsi_citation_pk,
     build_gsi_project_entries_pk,
     build_gsi_query_hash_pk,
+    build_gsi_stats_pk,
     build_invalidation_sk,
     build_pk,
+    build_stats_live_sk,
+    build_stats_period_sk,
 )
 from src.common.exceptions import CacheEntryNotFoundError, CacheWriteFailedError
 
@@ -402,6 +409,150 @@ class CacheRepository:
                     cache_entry_id=cache_entry_id,
                     document_id=doc_id,
                 )
+
+    # -----------------------------------------------------------------
+    # Stats operations (Phase 4)
+    # -----------------------------------------------------------------
+
+    def increment_stats_bucket(
+        self,
+        workspace_id: str,
+        project_id: str,
+        bucket: str,
+        hit_type: str,
+        tokens_saved_input: int,
+        tokens_saved_output: int,
+    ) -> None:
+        """Atomically increment a live stats bucket counter."""
+        pk = build_pk(self.application_id, self.client_id)
+        sk = build_stats_live_sk(workspace_id, project_id, bucket)
+
+        now_plus_48h = int(time.time()) + 48 * 3600
+
+        self.table.update_item(
+            Key={"PK": pk, "SK": sk},
+            UpdateExpression=(
+                "SET workspace_id = if_not_exists(workspace_id, :ws), "
+                "project_id = if_not_exists(project_id, :proj), "
+                "#bucket = if_not_exists(#bucket, :bkt), "
+                "#ttl = if_not_exists(#ttl, :ttl_val) "
+                "ADD #hit_type :one, "
+                "tokens_saved_input :tsi, "
+                "tokens_saved_output :tso"
+            ),
+            ExpressionAttributeNames={
+                "#hit_type": hit_type,
+                "#ttl": "ttl",
+                "#bucket": "bucket",
+            },
+            ExpressionAttributeValues={
+                ":ws": workspace_id,
+                ":proj": project_id,
+                ":bkt": bucket,
+                ":one": 1,
+                ":tsi": tokens_saved_input,
+                ":tso": tokens_saved_output,
+                ":ttl_val": now_plus_48h,
+            },
+        )
+
+    def query_stats_live_buckets(self, workspace_id: str, project_id: str) -> list[dict[str, Any]]:
+        """Query all live stats buckets for a scope."""
+        pk = build_pk(self.application_id, self.client_id)
+        sk_prefix = f"STATS_LIVE#WS#{workspace_id}#PROJ#{project_id}#"
+
+        all_items: list[dict[str, Any]] = []
+        last_key: dict | None = None
+        first = True
+
+        while first or last_key is not None:
+            first = False
+            kwargs: dict[str, Any] = {
+                "KeyConditionExpression": (Key("PK").eq(pk) & Key("SK").begins_with(sk_prefix)),
+            }
+            if last_key is not None:
+                kwargs["ExclusiveStartKey"] = last_key
+
+            response = self.table.query(**kwargs)
+            all_items.extend(response.get("Items", []))
+            last_key = response.get("LastEvaluatedKey")
+
+        return all_items
+
+    def put_stats_period(self, period: "StatsPeriodModel") -> None:
+        """Write a pre-aggregated stats period item."""
+        pk = build_pk(self.application_id, self.client_id)
+        sk = build_stats_period_sk(period.period, period.timestamp)
+        gsi4pk = build_gsi_stats_pk(
+            self.application_id, self.client_id, period.workspace_id, period.project_id
+        )
+        gsi4sk = f"STATS#{period.period}#{period.timestamp}"
+
+        item: dict[str, Any] = {
+            "PK": pk,
+            "SK": sk,
+            "GSI4PK": gsi4pk,
+            "GSI4SK": gsi4sk,
+            "workspace_id": period.workspace_id,
+            "project_id": period.project_id,
+            "period": period.period,
+            "timestamp": period.timestamp,
+            "exact_hits": period.exact_hits,
+            "semantic_hits": period.semantic_hits,
+            "misses": period.misses,
+            "total_lookups": period.total_lookups,
+            "hit_rate": str(period.hit_rate),
+            "exact_hit_rate": str(period.exact_hit_rate),
+            "semantic_hit_rate": str(period.semantic_hit_rate),
+            "tokens_saved_input": period.tokens_saved_input,
+            "tokens_saved_output": period.tokens_saved_output,
+            "estimated_cost_saved_usd": str(period.estimated_cost_saved_usd),
+            "total_entries": period.total_entries,
+            "ttl": period.ttl,
+        }
+
+        self.table.put_item(Item=item)
+
+    def query_stats_period(
+        self, workspace_id: str, project_id: str, period: str
+    ) -> "StatsPeriodModel | None":
+        """Query the most recent pre-aggregated stats for a period via GSI4."""
+        from src.cache.models import StatsPeriodModel
+
+        gsi4pk = build_gsi_stats_pk(self.application_id, self.client_id, workspace_id, project_id)
+
+        response = self.table.query(
+            IndexName="GSI4",
+            KeyConditionExpression=(
+                Key("GSI4PK").eq(gsi4pk) & Key("GSI4SK").begins_with(f"STATS#{period}#")
+            ),
+            ScanIndexForward=False,
+            Limit=1,
+        )
+
+        items = response.get("Items", [])
+        if not items:
+            return None
+
+        item = items[0]
+        return StatsPeriodModel(
+            workspace_id=item.get("workspace_id", workspace_id),
+            project_id=item.get("project_id", project_id),
+            period=item.get("period", period),
+            timestamp=item.get("timestamp", ""),
+            exact_hits=int(item.get("exact_hits", 0)),
+            semantic_hits=int(item.get("semantic_hits", 0)),
+            misses=int(item.get("misses", 0)),
+            total_lookups=int(item.get("total_lookups", 0)),
+            hit_rate=float(item.get("hit_rate", 0)),
+            exact_hit_rate=float(item.get("exact_hit_rate", 0)),
+            semantic_hit_rate=float(item.get("semantic_hit_rate", 0)),
+            tokens_saved_input=int(item.get("tokens_saved_input", 0)),
+            tokens_saved_output=int(item.get("tokens_saved_output", 0)),
+            estimated_cost_saved_usd=float(item.get("estimated_cost_saved_usd", 0)),
+            total_entries=int(item.get("total_entries", 0)),
+            ttl=int(item.get("ttl", 0)),
+        )
 
     # -----------------------------------------------------------------
     # Item conversion

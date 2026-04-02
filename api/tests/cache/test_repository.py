@@ -241,3 +241,78 @@ class TestCitationLinks:
         # After deletion, the GSI entry won't be present anymore
         # (moto may still return it from GSI since it uses eventual consistency,
         # but the main table item is gone)
+
+
+class TestStatsBucket:
+    """Tests for stats bucket DynamoDB operations."""
+
+    def test_increment_stats_creates_bucket(self, repo):
+        """First increment creates the bucket item."""
+        repo.increment_stats_bucket("ws_01", "proj_01", "2026-04-01T14:15", "exact_hits", 10, 5)
+
+        from src.cache.normalizer import build_pk, build_stats_live_sk
+
+        pk = build_pk("test-app", "test-client")
+        sk = build_stats_live_sk("ws_01", "proj_01", "2026-04-01T14:15")
+
+        response = repo.table.get_item(Key={"PK": pk, "SK": sk})
+        item = response["Item"]
+        assert item["exact_hits"] == 1
+        assert item["tokens_saved_input"] == 10
+        assert item["tokens_saved_output"] == 5
+
+    def test_increment_stats_accumulates(self, repo):
+        """Multiple increments accumulate atomically."""
+        repo.increment_stats_bucket("ws_01", "proj_01", "2026-04-01T14:15", "exact_hits", 10, 5)
+        repo.increment_stats_bucket("ws_01", "proj_01", "2026-04-01T14:15", "misses", 0, 0)
+        repo.increment_stats_bucket("ws_01", "proj_01", "2026-04-01T14:15", "exact_hits", 20, 10)
+
+        from src.cache.normalizer import build_pk, build_stats_live_sk
+
+        pk = build_pk("test-app", "test-client")
+        sk = build_stats_live_sk("ws_01", "proj_01", "2026-04-01T14:15")
+
+        response = repo.table.get_item(Key={"PK": pk, "SK": sk})
+        item = response["Item"]
+        assert item["exact_hits"] == 2
+        assert item["misses"] == 1
+        assert item["tokens_saved_input"] == 30
+        assert item["tokens_saved_output"] == 15
+
+    def test_query_stats_live_buckets(self, repo):
+        """Query returns all live buckets for a scope."""
+        repo.increment_stats_bucket("ws_01", "proj_01", "2026-04-01T14:00", "exact_hits", 0, 0)
+        repo.increment_stats_bucket("ws_01", "proj_01", "2026-04-01T14:15", "misses", 0, 0)
+
+        buckets = repo.query_stats_live_buckets("ws_01", "proj_01")
+        assert len(buckets) == 2
+
+    def test_put_and_query_stats_period(self, repo):
+        """Write and read a pre-aggregated stats period."""
+        from src.cache.models import StatsPeriodModel
+
+        period = StatsPeriodModel(
+            workspace_id="ws_01",
+            project_id="proj_01",
+            period="24h",
+            timestamp="2026-04-01T14:00",
+            exact_hits=100,
+            semantic_hits=30,
+            misses=50,
+            total_lookups=180,
+            hit_rate=0.722,
+            exact_hit_rate=0.556,
+            semantic_hit_rate=0.167,
+            tokens_saved_input=50000,
+            tokens_saved_output=30000,
+            estimated_cost_saved_usd=1.23,
+            total_entries=42,
+            ttl=9999999999,
+        )
+        repo.put_stats_period(period)
+
+        result = repo.query_stats_period("ws_01", "proj_01", "24h")
+        assert result is not None
+        assert result.exact_hits == 100
+        assert result.hit_rate == 0.722
+        assert result.estimated_cost_saved_usd == 1.23
