@@ -1,0 +1,28 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.0
+    hooks:
+      - id: ruff-format
+        args: [--check]
+        files: ^api/
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+        files: ^api/
+
+  - repo: https://github.com/antonbabenko/pre-commit-terraform
+    rev: v1.96.1
+    hooks:
+      - id: terraform_validate
+        files: ^terraform/
+      - id: terraform_fmt
+        files: ^terraform/
+
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest
+        entry: bash -c 'cd api && uv run pytest -x -q'
+        language: system
+        files: ^api/
+        stages: [pre-push]
+        pass_filenames: false

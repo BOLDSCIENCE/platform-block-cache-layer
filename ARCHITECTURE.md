@@ -2,9 +2,9 @@
 
 ## Architecture Planning Document
 
-**Version:** 1.0
+**Version:** 2.0
 **Status:** Draft
-**Last Updated:** 2026-02-10
+**Last Updated:** 2026-04-01
 
 ---
 
@@ -14,14 +14,22 @@ The Cache Layer is a platform block that provides intelligent response caching f
 
 Without a cache layer, every "How do I reset my password?" from every user triggers a full LLM inference cycle — embedding generation, context retrieval, prompt assembly, and model invocation. With the Cache Layer, the first query is processed normally and its response is cached. The next identical or similar query returns immediately from cache at zero inference cost and near-zero latency.
 
+The Cache Layer operates in the **Platform Context** (`APP#{application_id}#CLIENT#{client_id}`) per `constitution/multi-tenancy.md`. As a documented exception among platform blocks, it also supports `workspace_id` and `project_id` scoping for cache entries, since cache isolation at the workspace and project level is essential to prevent cross-domain cache pollution.
+
 **Key Design Principles:**
-- **Exact match caching** — hash-based lookup for identical queries returns cached responses in < 5ms
+- **Exact match caching** — hash-based DynamoDB lookup for identical queries returns cached responses in 5-10ms
 - **Semantic similarity caching** — embedding-based lookup finds cached responses for paraphrased or equivalent queries
-- **Per-tenant cache isolation** — caches are fully isolated per client, with optional project-level and user-level scoping
+- **Per-tenant cache isolation** — caches are fully isolated per application + client, with workspace, project, and optional user scoping
 - **Cache invalidation policies** — TTL-based, event-driven, and manual invalidation strategies to prevent stale responses
 - **Cost attribution** — tracks cache hits/misses per tenant for billing and optimization insights
 - **Transparent integration** — callers (Orchestration, Model Gateway) can enable caching with a single flag; no application-level changes required
 - **Configurable similarity thresholds** — clients control how "similar" a query must be to trigger a cache hit, balancing freshness vs. cost savings
+
+**Four Required Artifacts** (per `constitution/platform-blocks.md`):
+1. **API** — FastAPI + Mangum behind API Gateway with custom domain
+2. **SDK** — `boldsci-cache-layer` Python client for block-to-block consumption
+3. **Admin UI Package** — `@boldscience/admin-cache-layer` React component library for `platform-block-admin`
+4. **MCP Server** — `bold-cache-layer-mcp` agent-accessible interface
 
 ---
 
@@ -40,33 +48,57 @@ Without a cache layer, every "How do I reset my password?" from every user trigg
 11. [Data Model & Storage](#data-model--storage)
 12. [Authentication & Authorization](#authentication--authorization)
 13. [Platform Integration](#platform-integration)
-14. [Infrastructure Components](#infrastructure-components)
-15. [Error Handling](#error-handling)
-16. [Performance & Scaling](#performance--scaling)
-17. [Implementation Phases](#implementation-phases)
-18. [Appendix A: DynamoDB Schema](#appendix-a-dynamodb-schema)
-19. [Appendix B: Similarity Algorithms & Formulas](#appendix-b-similarity-algorithms--formulas)
-20. [Appendix C: Monitoring & Observability](#appendix-c-monitoring--observability)
+14. [Custom Domain & Service Discovery](#custom-domain--service-discovery)
+15. [Infrastructure Components](#infrastructure-components)
+16. [Error Handling](#error-handling)
+17. [Performance & Scaling](#performance--scaling)
+18. [SDK (`boldsci-cache-layer`)](#sdk-boldsci-cache-layer)
+19. [Admin UI Package (`@boldscience/admin-cache-layer`)](#admin-ui-package-boldscienceadmin-cache-layer)
+20. [MCP Server (`bold-cache-layer-mcp`)](#mcp-server-bold-cache-layer-mcp)
+21. [Implementation Phases](#implementation-phases)
+22. [Appendix A: DynamoDB Schema](#appendix-a-dynamodb-schema)
+23. [Appendix B: Similarity Algorithms & Formulas](#appendix-b-similarity-algorithms--formulas)
+24. [Appendix C: Monitoring & Observability](#appendix-c-monitoring--observability)
 
 ---
 
 ## Multi-Tenancy & Access Model
 
-The Cache Layer follows the Bold Platform's unified tenancy hierarchy. Every operation MUST include `client_id`. Cache entries are fully isolated per tenant — no cross-tenant cache sharing is ever possible. Within a tenant, caches can be further scoped by project for domain-specific isolation.
+The Cache Layer operates in the **Platform Context** per `constitution/multi-tenancy.md`. Every operation MUST include `application_id` and `client_id`, resolved from the `AuthContext` provided by the `boldsci-auth` SDK. Cache entries are fully isolated per application + client — no cross-tenant cache sharing is ever possible.
+
+### Platform Context Exception: Workspace & Project Scoping
+
+Unlike most platform blocks (which only scope to `application_id` + `client_id`), the Cache Layer additionally supports `workspace_id` and `project_id` scoping. This is a documented exception required because:
+
+- Cache entries are inherently domain-specific — a FAQ answer cached for a customer support project should never be returned for an HR bot query
+- Workspace-level isolation prevents cross-organizational cache pollution within a client
+- Project-level scoping aligns cache entries with the knowledge bases and configurations they were generated from
+
+The `workspace_id` and `project_id` are provided as request parameters (not resolved from `AuthContext`, which only provides platform identity).
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                          TENANCY HIERARCHY                                   │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                              │
+│  Application (application_id)                                                │
+│  └── Product scope — e.g., "scicoms", "boldpubs", "maxiq"                  │
+│      └── Platform-level isolation for API keys, config, rate limits        │
+│      └── DynamoDB PK prefix: APP#{application_id}#CLIENT#{client_id}       │
+│                                                                              │
 │  Client (client_id)                                                          │
 │  └── Top-level tenant — full cache isolation                                 │
-│      └── Separate DynamoDB partitions for cache entries                     │
-│      └── Separate embedding namespaces for semantic cache                  │
-│      └── Separate cache metrics and cost attribution                       │
+│      └── Resolved from AuthContext via boldsci-auth SDK                     │
+│      └── All rate limits and quotas bind to client_id                       │
 │                                                                              │
-│  Project (project_id) — Cache scope boundary                                 │
-│  └── Caches are scoped per project by default                               │
+│  Workspace (workspace_id) — Cache scope boundary [EXCEPTION]                │
+│  └── Organizational container within a client                                │
+│      └── Provided as request parameter, not from AuthContext                │
+│      └── Cache entries scoped per workspace                                 │
+│      └── Workspace-level TTL and threshold overrides                        │
+│                                                                              │
+│  Project (project_id) — Cache scope boundary [EXCEPTION]                     │
+│  └── Caches are scoped per project within a workspace                       │
 │      └── A query cached in "customer-support" will NOT hit for "hr-bot"    │
 │      └── Prevents cross-domain cache pollution                              │
 │      └── Project-level TTL and threshold overrides                          │
@@ -82,12 +114,6 @@ The Cache Layer follows the Bold Platform's unified tenancy hierarchy. Every ope
 │      └── Immutable once written; new responses create new entries           │
 │      └── TTL-governed lifecycle                                              │
 │                                                                              │
-│  Cache Namespace (namespace)                                                 │
-│  └── Logical grouping within a project                                       │
-│      └── Default: "default"                                                  │
-│      └── Allows fine-grained separation (e.g., "faq", "technical", "hr")   │
-│      └── Independent TTL and invalidation policies per namespace            │
-│                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -95,18 +121,21 @@ The Cache Layer follows the Bold Platform's unified tenancy hierarchy. Every ope
 
 | Aspect | Cache Layer | Model Gateway | Orchestration | Retrieval Service | Conversation Manager |
 |--------|------------|---------------|---------------|-------------------|---------------------|
-| **Top Level** | `client_id` | `client_id` | `client_id` | `client_id` | `client_id` |
-| **Organization** | `project_id` | `project_id` (optional) | `project_id` | `project_id` | `project_id` |
-| **Resource** | `cache_entry` | `request` | `execution` | `query` / `result` | `session` / `message` |
-| **API Key** | `X-API-Key` | `X-API-Key` | `X-API-Key` | `X-API-Key` | `X-API-Key` |
+| **Context** | Platform (with exception) | Platform | Platform | Platform | Platform |
+| **Top Level** | `application_id` + `client_id` | `application_id` + `client_id` | `application_id` + `client_id` | `application_id` + `client_id` | `application_id` + `client_id` |
+| **Additional Scoping** | `workspace_id` + `project_id` (exception) | None | None | None | None |
+| **Auth SDK** | `boldsci-auth` | `boldsci-auth` | `boldsci-auth` | `boldsci-auth` | `boldsci-auth` |
+| **API Key** | Shared Lambda Authorizer | Shared Lambda Authorizer | Shared Lambda Authorizer | Shared Lambda Authorizer | Shared Lambda Authorizer |
 
 ---
 
 ## Core Design Philosophy
 
-### Principle 1: Check Cache Before Inference
+### Principle 1: Check Cache Before Inference (After Input Guardrails)
 
-The Cache Layer sits on the critical path before the Model Gateway. Every query is checked against the cache first. If a hit is found, the cached response is returned immediately, bypassing all downstream processing (retrieval, prompt assembly, LLM inference). This is the primary value proposition — eliminating redundant computation.
+The Cache Layer sits on the critical path after Guardrails input scan but before the Model Gateway. Every query is checked against the cache after it has been sanitized by Guardrails. If a hit is found (and the guardrail policy version is current), the cached response is returned immediately, bypassing all downstream processing. This is the primary value proposition — eliminating redundant computation.
+
+> See `platform-block-orchestration/ARCHITECTURE.md` § Canonical Pipeline Ordering for the authoritative 8-step pipeline that defines the relationship between Guardrails input scan (Step 1), Cache lookup (Step 2), and Guardrails output scan (Step 7).
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -117,19 +146,25 @@ The Cache Layer sits on the critical path before the Model Gateway. Every query 
 │      │                                                                       │
 │      ▼                                                                       │
 │  ┌──────────────────┐                                                       │
+│  │ GUARDRAILS       │  ← PII redaction, injection detection                  │
+│  │ (Input Scan)     │    MUST run before cache — query may contain PII       │
+│  └────────┬─────────┘                                                       │
+│           │ sanitized_query + guardrail_policy_version                       │
+│           ▼                                                                  │
+│  ┌──────────────────┐                                                       │
 │  │ CACHE LAYER      │  ← Check exact match, then semantic similarity         │
-│  │ (Cache Lookup)   │                                                       │
+│  │ (Cache Lookup)   │    on the sanitized query                              │
 │  └────────┬─────────┘                                                       │
 │           │                                                                  │
 │     ┌─────┴──────┐                                                          │
 │     │            │                                                          │
-│   HIT          MISS                                                         │
+│   HIT          MISS (or stale policy version)                               │
 │     │            │                                                          │
 │     ▼            ▼                                                          │
 │  Return       ┌──────────────────┐                                          │
 │  cached       │ ORCHESTRATION    │  Retrieval → Prompt → Model Gateway      │
-│  response     │ + MODEL GATEWAY  │                                          │
-│  (< 5ms)      └────────┬─────────┘                                          │
+│  response     │ + MODEL GATEWAY  │  → Guardrails Output Scan                │
+│  (5-10ms)     └────────┬─────────┘                                          │
 │                         │                                                    │
 │                         ▼                                                    │
 │                ┌──────────────────┐                                          │
@@ -145,12 +180,12 @@ The Cache Layer sits on the critical path before the Model Gateway. Every query 
 
 ### Principle 2: Two-Tier Cache Strategy
 
-Exact match caching is fast and cheap. Semantic caching is slower and more expensive (requires embedding generation + vector similarity search), but catches paraphrased queries that exact match misses. The Cache Layer runs both in sequence: exact match first (< 5ms), then semantic similarity (50-150ms) only if exact match misses.
+Exact match caching is fast and cheap. Semantic caching is slower and more expensive (requires embedding generation + vector similarity search), but catches paraphrased queries that exact match misses. The Cache Layer runs both in sequence: exact match first (5-10ms via DynamoDB GetItem), then semantic similarity (50-150ms) only if exact match misses.
 
 ```
 Query: "How do I reset my password?"
   │
-  ├── Tier 1: EXACT MATCH (SHA-256 hash lookup)
+  ├── Tier 1: EXACT MATCH (SHA-256 hash lookup via DynamoDB GetItem)
   │     └── Hash matches "How do I reset my password?" → HIT
   │
   ├── Tier 2: SEMANTIC SIMILARITY (only if Tier 1 misses)
@@ -162,7 +197,7 @@ Query: "How do I reset my password?"
 
 ### Principle 3: Cache Isolation by Design
 
-Enterprise customers require absolute data isolation. A cache entry created by Client A must never be returned to Client B. Within a client, caches are further scoped by project to prevent cross-domain contamination. A FAQ answer cached for a customer support bot should never be returned for an internal HR query, even within the same client.
+Enterprise customers require absolute data isolation. A cache entry created by Client A in Application X must never be returned to Client B or Application Y. Within a client, caches are further scoped by workspace and project to prevent cross-domain contamination. A FAQ answer cached for a customer support project should never be returned for an internal HR query, even within the same client.
 
 ### Principle 4: Staleness Is Worse Than a Cache Miss
 
@@ -170,7 +205,7 @@ A stale cached response (outdated information, wrong context) is worse than the 
 - TTL-based expiration (default: 1 hour for semantic, 24 hours for exact match)
 - Event-driven invalidation (knowledge base update → invalidate related caches)
 - Manual purge API for operators
-- Configurable per namespace, per project
+- Configurable per workspace, per project
 
 ---
 
@@ -183,6 +218,7 @@ A stale cached response (outdated information, wrong context) is worse than the 
 │    ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
 │    │ Orchestration│  │ Model Gateway│  │  Chat UIs    │  │  Direct API  │      │
 │    │ Block        │  │ (pre-check)  │  │              │  │  Consumers   │      │
+│    │ (via SDK)    │  │ (via SDK)    │  │              │  │              │      │
 │    └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘      │
 │           │                 │                  │                  │              │
 └───────────┼─────────────────┼──────────────────┼──────────────────┼──────────────┘
@@ -191,53 +227,59 @@ A stale cached response (outdated information, wrong context) is worse than the 
                                        │
                                        ▼
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                         API GATEWAY + LAMBDA                                     │
+│        API GATEWAY + LAMBDA (cache-layer-api.{env}.boldquantum.com)             │
 │                                                                                  │
 │  ┌───────────────────────────────────────────────────────────────────────────┐  │
 │  │                       Cache Layer API                                      │  │
 │  │                                                                            │  │
-│  │  POST /v1/cache/lookup         — Check cache for a query (exact+semantic) │  │
-│  │  POST /v1/cache/write          — Write a response to cache                │  │
-│  │  POST /v1/cache/lookup-or-exec — Lookup, and on miss execute via callback │  │
+│  │  GET  /health                     — Health check (no auth)                │  │
+│  │  POST /v1/cache/lookup            — Check cache (exact + semantic)        │  │
+│  │  POST /v1/cache/write             — Write a response to cache             │  │
+│  │  POST /v1/cache/lookup-or-exec    — Lookup, and on miss execute callback  │  │
 │  │                                                                            │  │
-│  │  DELETE /v1/cache/entries/{id}  — Invalidate a specific cache entry       │  │
-│  │  POST /v1/cache/invalidate     — Bulk invalidation by scope/query         │  │
-│  │  POST /v1/cache/purge          — Purge all cache for a scope             │  │
+│  │  DELETE /v1/cache/entries/{id}    — Invalidate a specific cache entry     │  │
+│  │  POST /v1/cache/invalidate        — Bulk invalidation by scope/query      │  │
+│  │  POST /v1/cache/purge             — Purge all cache for a scope           │  │
 │  │                                                                            │  │
-│  │  GET  /v1/cache/stats          — Cache hit/miss statistics                │  │
-│  │  GET  /v1/cache/config         — Get cache configuration for scope        │  │
-│  │  PUT  /v1/cache/config         — Update cache configuration               │  │
+│  │  GET  /v1/cache/stats             — Cache hit/miss statistics             │  │
+│  │  GET  /v1/cache/config            — Get cache configuration               │  │
+│  │  PUT  /v1/cache/config            — Update cache configuration            │  │
 │  │                                                                            │  │
 │  └───────────────────────────────────────────────────────────────────────────┘  │
 │                                       │                                          │
 └───────────────────────────────────────┼──────────────────────────────────────────┘
                                         │
-          ┌────────────────────────────┬┴────────────────────────────┐
-          │                            │                              │
-          ▼                            ▼                              ▼
-┌──────────────────┐        ┌──────────────────┐          ┌──────────────────┐
-│   ElastiCache    │        │    DynamoDB      │          │    Bedrock       │
-│   (Redis)        │        │                  │          │                  │
-│                  │        │ • Cache entries   │          │ • Query          │
-│ • Exact match    │        │   (durable)      │          │   embedding      │
-│   hash index     │        │ • Cache config   │          │   generation     │
-│ • Hot cache      │        │ • Invalidation   │          │   (Titan Embed)  │
-│ • TTL management │        │   events         │          │                  │
-│ • Atomic ops     │        │ • Stats / audit  │          │ • Semantic       │
-│                  │        │                  │          │   similarity     │
-└──────────────────┘        └──────────────────┘          └──────────────────┘
+          ┌─────────────────────────────┴──────────────────────────┐
+          │                                                        │
+          ▼                                                        ▼
+┌──────────────────┐                                    ┌──────────────────┐
+│    DynamoDB      │                                    │  Model Gateway   │
+│                  │                                    │  (via boldsci-   │
+│ • Cache entries  │                                    │   model-gateway  │
+│   (exact match + │                                    │   SDK)           │
+│   durable store) │                                    │                  │
+│ • Cache config   │                                    │ • Query          │
+│ • Invalidation   │                                    │   embedding      │
+│   events         │                                    │   generation     │
+│ • Stats / audit  │                                    │   (POST /v1/     │
+│                  │                                    │   embed)         │
+└──────────────────┘                                    └──────────────────┘
           │
           ▼
 ┌──────────────────┐
 │   OpenSearch     │
-│   Serverless     │
+│   (Provisioned)  │
 │                  │
-│ • Semantic cache │
-│   embeddings    │
+│ • Cache Layer    │
+│   provisions the │
+│   shared domain  │
+│ • Index:         │
+│   bold-semantic- │
+│   cache          │
 │ • kNN similarity │
 │   search         │
 │ • Tenant-scoped  │
-│   index          │
+│   queries        │
 └──────────────────┘
 ```
 
@@ -259,19 +301,19 @@ Query: "How do I reset my password?"
   │     └── Normalized: "how do i reset my password?"
   │
   ├── Step 2: COMPUTE CACHE KEY
-  │     ├── Build scope prefix: {client_id}:{project_id}:{namespace}
+  │     ├── Build scope: {application_id}:{client_id}:{workspace_id}:{project_id}
   │     ├── SHA-256 hash of normalized query
-  │     └── Cache key: "acme-corp:customer-support:default:sha256_abc123..."
+  │     └── Cache key components for DynamoDB GetItem
   │
-  ├── Step 3: EXACT MATCH LOOKUP (Redis)
-  │     ├── GET cache_key from Redis
+  ├── Step 3: EXACT MATCH LOOKUP (DynamoDB GetItem)
+  │     ├── GetItem with PK + SK (query hash lookup via GSI)
   │     ├── If found and not expired → EXACT HIT
   │     │     └── Return cached response + metadata
   │     └── If not found → proceed to Step 4
   │
   ├── Step 4: SEMANTIC SIMILARITY LOOKUP (if enabled)
-  │     ├── Generate query embedding via Bedrock Titan Embed v2
-  │     ├── kNN search in OpenSearch (scoped to client + project + namespace)
+  │     ├── Generate query embedding via boldsci-model-gateway SDK
+  │     ├── kNN search in OpenSearch (scoped to application + client + workspace + project)
   │     ├── Filter results above similarity threshold (default: 0.92)
   │     ├── If match found → SEMANTIC HIT
   │     │     └── Return cached response + similarity score + matched query
@@ -293,18 +335,20 @@ Each cache lookup request can customize the lookup behavior:
     "enable_semantic": true,
     "similarity_threshold": 0.92,
     "max_age_seconds": 3600,
-    "namespace": "default"
+    "workspace_id": "ws_01JKX...",
+    "project_id": "customer-support"
   }
 }
 ```
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `enable_exact_match` | `true` | Check exact match cache (Redis) |
+| `enable_exact_match` | `true` | Check exact match cache (DynamoDB GetItem) |
 | `enable_semantic` | `true` | Check semantic similarity cache (OpenSearch) |
 | `similarity_threshold` | `0.92` | Minimum cosine similarity for semantic hit |
 | `max_age_seconds` | `null` (use entry TTL) | Override: only return entries younger than this |
-| `namespace` | `"default"` | Cache namespace within the project |
+| `workspace_id` | required | Workspace scope for cache lookup |
+| `project_id` | required | Project scope within the workspace |
 
 ---
 
@@ -312,7 +356,7 @@ Each cache lookup request can customize the lookup behavior:
 
 ### How It Works
 
-Exact match caching uses a deterministic hash of the normalized query string as the cache key. If two queries produce the same hash, they are treated as identical. This is fast (< 5ms), cheap (no embedding cost), and precise (no false positives).
+Exact match caching uses a deterministic hash of the normalized query string as the cache key. If two queries produce the same hash, they are treated as identical. This is fast (5-10ms via DynamoDB GetItem), cheap (no embedding cost), and precise (no false positives).
 
 ### Cache Key Construction
 
@@ -322,20 +366,21 @@ Exact match caching uses a deterministic hash of the normalized query string as 
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                              │
 │  Components:                                                                 │
-│  ┌─────────────┬────────────────────┬───────────────┬──────────────────┐   │
-│  │  client_id  │    project_id      │   namespace   │   query_hash     │   │
-│  │  (tenant)   │    (scope)         │   (grouping)  │   (SHA-256)      │   │
-│  └──────┬──────┴─────────┬──────────┴───────┬───────┴────────┬─────────┘   │
-│         │                │                  │                │              │
-│         ▼                ▼                  ▼                ▼              │
-│  "acme-corp"    "customer-support"     "default"    "a7f3b2c1..."         │
+│  ┌───────────────┬────────────┬──────────────┬────────────┬──────────────┐ │
+│  │application_id │ client_id  │ workspace_id │ project_id │ query_hash   │ │
+│  │ (platform)    │ (tenant)   │ (scope)      │ (scope)    │ (SHA-256)    │ │
+│  └──────┬────────┴─────┬──────┴──────┬───────┴─────┬──────┴──────┬───────┘ │
+│         │              │             │             │             │          │
+│         ▼              ▼             ▼             ▼             ▼          │
+│    "scicoms"     "acme-corp"   "ws_01JKX..."  "cust-supp"  "a7f3b2c1..."  │
 │                                                                              │
-│  Full key: "acme-corp:customer-support:default:a7f3b2c1..."                │
+│  DynamoDB PK: APP#scicoms#CLIENT#acme-corp                                  │
+│  DynamoDB SK: CACHE#ws_01JKX...#cust-supp#a7f3b2c1...                      │
 │                                                                              │
 │  Optional context hash (when context_aware_caching is enabled):            │
 │  └── Includes hash of system prompt + retrieval context                    │
 │      └── Same query with different context = different cache entry          │
-│      └── Key: "acme-corp:customer-support:default:a7f3b2c1...:ctx_d4e5f6" │
+│      └── Appended to SK: ...#ctx_d4e5f6                                    │
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -365,35 +410,39 @@ Examples of normalization:
 | " How do I  reset my password?? " | "how do i reset my password?" | Yes |
 | "What's the password reset process?" | "what's the password reset process?" | No (different query) |
 
-### Redis Storage Format
+### DynamoDB Storage Format
+
+Exact match entries are stored directly in DynamoDB. A GetItem on the GSI-QueryHash index provides O(1) lookup:
 
 ```json
 {
-  "key": "acme-corp:customer-support:default:a7f3b2c1...",
-  "value": {
-    "cache_entry_id": "ce-01JKX001...",
-    "query_normalized": "how do i reset my password?",
-    "response": {
-      "content": "To reset your password, follow these steps: 1. Go to the login page...",
-      "model": "anthropic.claude-sonnet-4-5-20250929",
-      "tokens_used": { "input": 245, "output": 180 },
-      "citations": [
-        {
-          "document_id": "doc-uuid-001",
-          "document_title": "IT Help Desk FAQ",
-          "chunk_id": "chunk-uuid-123"
-        }
-      ]
-    },
-    "metadata": {
-      "created_at": "2026-02-10T12:00:00Z",
-      "created_by_user": "user-abc123",
-      "original_request_id": "req-uuid-456",
-      "hit_count": 47,
-      "last_hit_at": "2026-02-10T14:30:00Z"
-    }
+  "PK": "APP#scicoms#CLIENT#acme-corp",
+  "SK": "CACHE#ws_01JKX...#customer-support#ce-01JKX001...",
+  "cache_entry_id": "ce-01JKX001...",
+  "workspace_id": "ws_01JKX...",
+  "project_id": "customer-support",
+  "query_normalized": "how do i reset my password?",
+  "query_hash": "a7f3b2c1...",
+  "response": {
+    "content": "To reset your password, follow these steps: 1. Go to the login page...",
+    "model": "anthropic.claude-sonnet-4-5-20250929",
+    "tokens_used": { "input": 245, "output": 180 },
+    "citations": [
+      {
+        "document_id": "doc-uuid-001",
+        "document_title": "IT Help Desk FAQ",
+        "chunk_id": "chunk-uuid-123"
+      }
+    ]
   },
-  "ttl": 86400
+  "guardrail_policy_version": "v3",
+  "hit_count": 47,
+  "last_hit_at": "2026-02-10T14:30:00Z",
+  "created_at": "2026-02-10T12:00:00Z",
+  "created_by_user": "user-abc123",
+  "original_request_id": "req-uuid-456",
+  "status": "active",
+  "ttl": 1707696000
 }
 ```
 
@@ -420,7 +469,7 @@ When `context_hash_inputs` is provided, the relevant context fields are hashed a
 
 ### How It Works
 
-Semantic similarity caching captures paraphrased, reworded, or rephrased versions of the same question. When an exact match misses, the Cache Layer generates an embedding of the query and performs a kNN similarity search against all cached query embeddings within the same scope (client + project + namespace).
+Semantic similarity caching captures paraphrased, reworded, or rephrased versions of the same question. When an exact match misses, the Cache Layer generates an embedding of the query and performs a kNN similarity search against all cached query embeddings within the same scope (application + client + workspace + project).
 
 If the most similar cached query exceeds the similarity threshold (default: 0.92), the cached response is returned as a semantic hit.
 
@@ -458,32 +507,45 @@ The similarity threshold is the critical tuning parameter. Too low → stale or 
 
 ### Embedding Generation
 
-Query embeddings are generated using Amazon Bedrock Titan Embed v2 (the same model used by the Retrieval Service for consistency):
+Query embeddings are generated via the `boldsci-model-gateway` SDK (the standard typed Python client for Model Gateway, per `constitution/platform-blocks.md`):
 
-```json
-{
-  "modelId": "amazon.titan-embed-text-v2:0",
-  "contentType": "application/json",
-  "body": {
-    "inputText": "how do i reset my password?",
-    "dimensions": 1024,
-    "normalize": true
-  }
-}
+```python
+from boldsci.model_gateway import ModelGatewayClient
+
+mg_client = ModelGatewayClient()
+embedding_response = mg_client.embed(
+    model="titan-embed-text",
+    input=normalized_query,
+    dimensions=1024,
+    normalize=True,
+    application_id=auth.application_id,
+    client_id=auth.client_id,
+)
+query_embedding = embedding_response.embeddings[0].embedding
 ```
+
+The SDK handles:
+- Service discovery via SSM (`/bold/model-gateway/api-url`)
+- Auth header injection (`X-Service-Key` + `X-Forwarded-Client-Id`)
+- Retry and error handling
 
 The resulting 1024-dimensional vector is stored in OpenSearch alongside the cache entry reference.
 
+> Prior to SDK consolidation, the Cache Layer called Model Gateway HTTP endpoints directly. All block-to-block communication now uses the target block's SDK per `constitution/platform-blocks.md` § Section 7.
+
 ### OpenSearch Semantic Cache Index
+
+The Cache Layer provisions the shared OpenSearch domain (it is the first platform block to require OpenSearch). The domain endpoint is registered in SSM at `/bold/opensearch/domain-endpoint` for other blocks to discover.
 
 ```json
 {
   "mappings": {
     "properties": {
       "cache_entry_id": { "type": "keyword" },
+      "application_id": { "type": "keyword" },
       "client_id": { "type": "keyword" },
+      "workspace_id": { "type": "keyword" },
       "project_id": { "type": "keyword" },
-      "namespace": { "type": "keyword" },
       "query_normalized": { "type": "text" },
       "query_embedding": {
         "type": "knn_vector",
@@ -520,9 +582,10 @@ The resulting 1024-dimensional vector is stored in OpenSearch alongside the cach
         }
       ],
       "filter": [
+        { "term": { "application_id": "scicoms" } },
         { "term": { "client_id": "acme-corp" } },
+        { "term": { "workspace_id": "ws_01JKX..." } },
         { "term": { "project_id": "customer-support" } },
-        { "term": { "namespace": "default" } },
         { "range": { "expires_at": { "gte": "now" } } }
       ]
     }
@@ -531,7 +594,7 @@ The resulting 1024-dimensional vector is stored in OpenSearch alongside the cach
 }
 ```
 
-The `min_score` parameter ensures only results above the similarity threshold are returned.
+The `min_score` parameter ensures only results above the similarity threshold are returned. The `application_id` and `client_id` filters enforce tenant isolation at the query level per `constitution/multi-tenancy.md` Layer 3.
 
 ### Semantic Match Response
 
@@ -544,7 +607,7 @@ When a semantic hit is found, the response includes the matched query for transp
   "similarity_score": 0.946,
   "matched_query": "What's the process for resetting my password?",
   "original_query": "How do I reset my password?",
-  "response": { ... },
+  "response": { "..." },
   "cache_entry_id": "ce-01JKX001..."
 }
 ```
@@ -574,12 +637,11 @@ Fresh Response from Model Gateway
   ├── Step 2: GENERATE CACHE ENTRY
   │     ├── Generate cache_entry_id (ULID)
   │     ├── Compute query hash (SHA-256 of normalized query)
-  │     ├── Generate query embedding (Bedrock Titan Embed v2)
-  │     └── Compute TTL from namespace config or default
+  │     ├── Generate query embedding (boldsci-model-gateway SDK)
+  │     └── Compute TTL from project config or default
   │
   ├── Step 3: WRITE TO STORES (parallel)
-  │     ├── Write to Redis (exact match cache) with TTL
-  │     ├── Write to DynamoDB (durable record + metadata)
+  │     ├── Write to DynamoDB (exact match cache + durable record + metadata)
   │     └── Write to OpenSearch (semantic cache embedding + metadata)
   │
   └── Step 4: RETURN CONFIRMATION
@@ -601,10 +663,45 @@ Not all responses should be cached. The Cache Layer applies these rules:
 
 ### Write Consistency
 
-Writes to the three stores (Redis, DynamoDB, OpenSearch) happen in parallel for performance. If any write fails:
-- **Redis write fails**: Log warning, continue. DynamoDB is the durable store; Redis can be repopulated on next read.
-- **DynamoDB write fails**: Retry once. If still fails, do not cache this response (data integrity).
-- **OpenSearch write fails**: Log warning, continue. Semantic lookup will miss, but exact match still works.
+Writes to the two stores (DynamoDB, OpenSearch) happen in parallel for performance. If any write fails:
+- **DynamoDB write fails**: Retry once. If still fails, do not cache this response (data integrity). DynamoDB is the primary store.
+- **OpenSearch write fails**: Log warning, continue. Semantic lookup will miss, but exact match still works via DynamoDB.
+
+### Guardrail Policy Versioning
+
+Cache entries store a `guardrail_policy_version` field that records which version of the Guardrails safety policies were in effect when the response was generated and validated.
+
+**On cache write (Step 8 of canonical pipeline):**
+- The Orchestration block passes the current `guardrail_policy_version` (obtained from the `X-Guardrail-Policy-Version` response header on the Guardrails scan calls)
+- The Cache Layer stores this version alongside the cache entry in both stores (DynamoDB, OpenSearch)
+
+**On cache hit (Step 2 of canonical pipeline):**
+- The Cache Layer returns the cached `guardrail_policy_version` in the lookup response
+- The Orchestration block compares it against the current policy version
+- If versions match → valid cache hit, return cached response
+- If versions differ → stale cache hit, treat as miss and re-execute the full pipeline
+
+**On policy change:**
+- When the Guardrails block publishes a `bold.guardrails.PolicyVersionChanged` event to EventBridge, the Cache Layer receives it
+- The event handler can optionally bulk-invalidate entries with the old policy version for proactive cleanup
+- Even without proactive cleanup, stale entries are detected at lookup time via version comparison
+
+```json
+{
+  "source": "bold.guardrails",
+  "detail-type": "PolicyVersionChanged",
+  "detail": {
+    "client_id": "acme-corp",
+    "application_id": "scicoms",
+    "previous_version": "v3",
+    "new_version": "v4",
+    "changed_policies": ["content-safety", "pii-detection"],
+    "timestamp": "2026-02-10T14:00:00.000Z"
+  }
+}
+```
+
+> See `platform-block-orchestration/ARCHITECTURE.md` § Canonical Pipeline Ordering for where this fits in the end-to-end flow.
 
 ---
 
@@ -619,20 +716,21 @@ Writes to the three stores (Redis, DynamoDB, OpenSearch) happen in parallel for 
 │                                                                              │
 │  Strategy 1: TTL-BASED EXPIRATION                                            │
 │  └── Every cache entry has a time-to-live                                    │
-│      └── Redis: native TTL expiration (automatic)                           │
 │      └── DynamoDB: TTL attribute (automatic, periodic cleanup)              │
 │      └── OpenSearch: expires_at filter on lookup (query-time filtering)     │
 │      └── Default TTLs:                                                      │
 │          └── Exact match: 24 hours                                          │
 │          └── Semantic match: 1 hour (more conservative — paraphrase risk)   │
-│          └── Configurable per namespace                                      │
+│          └── Configurable per project                                        │
 │                                                                              │
 │  Strategy 2: EVENT-DRIVEN INVALIDATION                                       │
 │  └── External events trigger cache invalidation                              │
 │      └── Knowledge base update (Doc Ingest publishes event)                 │
 │          └── Invalidate all semantic cache entries for affected project      │
-│      └── Policy change (Guardrails updates rules)                           │
-│          └── Invalidate caches where guardrail verdict may differ           │
+│      └── Policy change (Guardrails publishes PolicyVersionChanged)           │
+│          └── Cache entries with stale guardrail_policy_version are          │
+│              detected at lookup time (version mismatch → treat as miss)    │
+│          └── Optional: bulk-invalidate entries with old policy version     │
 │      └── Model change (Model Gateway switches model version)               │
 │          └── Invalidate all caches for affected scope                       │
 │      └── Events consumed via EventBridge                                    │
@@ -642,12 +740,6 @@ Writes to the three stores (Redis, DynamoDB, OpenSearch) happen in parallel for 
 │      └── DELETE /v1/cache/entries/{id} — single entry                       │
 │      └── POST /v1/cache/invalidate — bulk by query pattern or metadata     │
 │      └── POST /v1/cache/purge — full purge for a scope                     │
-│                                                                              │
-│  Strategy 4: LRU EVICTION (Redis only)                                       │
-│  └── When Redis memory is full, least recently used entries are evicted     │
-│      └── Redis maxmemory-policy: allkeys-lru                               │
-│      └── DynamoDB and OpenSearch retain entries until TTL expires           │
-│      └── Evicted Redis entries are repopulated from DynamoDB on next read  │
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -661,7 +753,9 @@ The Cache Layer subscribes to platform events that indicate cached data may be s
   "source": "bold.doc-ingest",
   "detail-type": "DocumentIngested",
   "detail": {
+    "application_id": "scicoms",
     "client_id": "acme-corp",
+    "workspace_id": "ws_01JKX...",
     "project_id": "customer-support",
     "document_id": "doc-uuid-001",
     "action": "updated"
@@ -670,17 +764,17 @@ The Cache Layer subscribes to platform events that indicate cached data may be s
 ```
 
 When this event is received:
-1. Look up all cache entries for `client_id=acme-corp, project_id=customer-support`
+1. Look up all cache entries for `application_id=scicoms, client_id=acme-corp, workspace_id=ws_01JKX..., project_id=customer-support`
 2. Check if any cached responses referenced `document_id=doc-uuid-001` in their citations
-3. Invalidate matching entries (delete from Redis, mark as invalidated in DynamoDB, delete from OpenSearch)
+3. Invalidate matching entries (mark as invalidated in DynamoDB, delete from OpenSearch)
 
 ```json
 {
   "source": "bold.model-gateway",
   "detail-type": "ModelVersionChanged",
   "detail": {
+    "application_id": "scicoms",
     "client_id": "acme-corp",
-    "project_id": "customer-support",
     "old_model": "anthropic.claude-sonnet-4-5-20250929",
     "new_model": "anthropic.claude-opus-4-6-20250916"
   }
@@ -697,8 +791,8 @@ Invalidation operations support multiple scoping levels:
 |-------|--------|----------|
 | Single entry | Delete one cache entry by ID | Manual correction |
 | By query pattern | Invalidate entries matching a query substring | Topic-specific refresh |
-| By namespace | Invalidate all entries in a namespace | Category refresh |
 | By project | Invalidate all entries in a project | Knowledge base overhaul |
+| By workspace | Invalidate all entries in a workspace | Workspace-wide refresh |
 | By client | Invalidate all entries for a client | Full cache reset |
 | By citation | Invalidate entries citing a specific document | Document updated |
 
@@ -706,7 +800,22 @@ Invalidation operations support multiple scoping levels:
 
 ## API Design
 
-All endpoints are authenticated via `X-API-Key` header and require `client_id`.
+All endpoints are authenticated via the shared Lambda Authorizer (resolved from SSM at `/bold/auth/authorizer-arn`) except `GET /health`. The `AuthContext` provides `application_id` and `client_id` via the `boldsci-auth` SDK.
+
+### GET /health
+
+Health check endpoint. No auth required. Used for service discovery and monitoring.
+
+**Response:**
+
+```json
+{
+  "status": "healthy",
+  "service": "cache-layer",
+  "version": "2.0.0",
+  "timestamp": "2026-04-01T12:00:00Z"
+}
+```
 
 ### POST /v1/cache/lookup
 
@@ -716,7 +825,7 @@ Check the cache for a query. Returns a hit (with cached response) or a miss.
 
 ```json
 {
-  "client_id": "acme-corp",
+  "workspace_id": "ws_01JKX...",
   "project_id": "customer-support",
   "query": "How do I reset my password?",
   "request_id": "req-uuid-456",
@@ -724,12 +833,13 @@ Check the cache for a query. Returns a hit (with cached response) or a miss.
     "enable_exact_match": true,
     "enable_semantic": true,
     "similarity_threshold": 0.92,
-    "max_age_seconds": null,
-    "namespace": "default"
+    "max_age_seconds": null
   },
   "context_hash_inputs": null
 }
 ```
+
+> `application_id` and `client_id` are resolved from `AuthContext` (injected by the shared Lambda Authorizer) — not provided in the request body.
 
 **Response (Cache Hit — Exact):**
 
@@ -761,7 +871,7 @@ Check the cache for a query. Returns a hit (with cached response) or a miss.
     "last_hit_at": "2026-02-10T14:30:00Z",
     "ttl_remaining_seconds": 34200
   },
-  "lookup_latency_ms": 3,
+  "lookup_latency_ms": 7,
   "cost_saved_estimate_usd": 0.0042
 }
 ```
@@ -776,8 +886,8 @@ Check the cache for a query. Returns a hit (with cached response) or a miss.
   "similarity_score": 0.946,
   "matched_query": "What's the process for resetting my password?",
   "cache_entry_id": "ce-01JKX001...",
-  "response": { ... },
-  "cache_metadata": { ... },
+  "response": { "..." },
+  "cache_metadata": { "..." },
   "lookup_latency_ms": 87,
   "cost_saved_estimate_usd": 0.0042
 }
@@ -791,8 +901,8 @@ Check the cache for a query. Returns a hit (with cached response) or a miss.
   "status": "miss",
   "lookup_latency_ms": 92,
   "stages": {
-    "exact_match_ms": 2,
-    "semantic_ms": 90,
+    "exact_match_ms": 7,
+    "semantic_ms": 85,
     "semantic_best_score": 0.71,
     "semantic_threshold": 0.92
   }
@@ -807,7 +917,7 @@ Write a response to the cache after a successful LLM invocation.
 
 ```json
 {
-  "client_id": "acme-corp",
+  "workspace_id": "ws_01JKX...",
   "project_id": "customer-support",
   "request_id": "req-uuid-456",
   "query": "How do I reset my password?",
@@ -828,7 +938,6 @@ Write a response to the cache after a successful LLM invocation.
     ]
   },
   "write_config": {
-    "namespace": "default",
     "ttl_seconds": 86400,
     "enable_semantic": true,
     "cache_control": "public"
@@ -844,7 +953,6 @@ Write a response to the cache after a successful LLM invocation.
   "request_id": "req-uuid-456",
   "status": "written",
   "stores": {
-    "redis": "ok",
     "dynamodb": "ok",
     "opensearch": "ok"
   },
@@ -861,21 +969,19 @@ Convenience endpoint that combines lookup and execution. If a cache hit is found
 
 ```json
 {
-  "client_id": "acme-corp",
+  "workspace_id": "ws_01JKX...",
   "project_id": "customer-support",
   "query": "How do I reset my password?",
   "request_id": "req-uuid-789",
   "lookup_config": {
     "enable_exact_match": true,
     "enable_semantic": true,
-    "similarity_threshold": 0.92,
-    "namespace": "default"
+    "similarity_threshold": 0.92
   },
   "on_miss": {
-    "callback_url": "https://api.bold.internal/model-gateway/v1/invoke",
+    "callback_url": "https://model-api.dev.boldquantum.com/v1/invoke",
     "callback_method": "POST",
     "callback_body": {
-      "client_id": "acme-corp",
       "model": "anthropic.claude-sonnet-4-5-20250929",
       "messages": [
         { "role": "user", "content": "How do I reset my password?" }
@@ -903,7 +1009,6 @@ Invalidate a specific cache entry.
   "cache_entry_id": "ce-01JKX001...",
   "status": "invalidated",
   "stores": {
-    "redis": "deleted",
     "dynamodb": "marked_invalidated",
     "opensearch": "deleted"
   }
@@ -918,10 +1023,9 @@ Bulk invalidation by scope, query pattern, or citation reference.
 
 ```json
 {
-  "client_id": "acme-corp",
+  "workspace_id": "ws_01JKX...",
   "project_id": "customer-support",
   "invalidation_criteria": {
-    "namespace": "default",
     "query_contains": "password",
     "cited_document_ids": ["doc-uuid-001"],
     "created_before": "2026-02-09T00:00:00Z"
@@ -935,7 +1039,7 @@ Bulk invalidation by scope, query pattern, or citation reference.
 {
   "request_id": "req-uuid-999",
   "entries_invalidated": 12,
-  "invalidation_criteria": { ... },
+  "invalidation_criteria": { "..." },
   "created_at": "2026-02-10T15:00:00Z"
 }
 ```
@@ -948,14 +1052,13 @@ Purge all cache entries for a scope.
 
 ```json
 {
-  "client_id": "acme-corp",
+  "workspace_id": "ws_01JKX...",
   "project_id": "customer-support",
-  "namespace": null,
   "confirm": true
 }
 ```
 
-When `namespace` is null, all namespaces in the project are purged. The `confirm` field must be `true` to prevent accidental purges.
+When `project_id` is null, all projects in the workspace are purged. The `confirm` field must be `true` to prevent accidental purges.
 
 **Response:**
 
@@ -964,9 +1067,10 @@ When `namespace` is null, all namespaces in the project are purged. The `confirm
   "request_id": "req-uuid-888",
   "entries_purged": 1247,
   "scope": {
+    "application_id": "scicoms",
     "client_id": "acme-corp",
-    "project_id": "customer-support",
-    "namespace": "all"
+    "workspace_id": "ws_01JKX...",
+    "project_id": "customer-support"
   },
   "created_at": "2026-02-10T15:00:00Z"
 }
@@ -980,16 +1084,19 @@ Get cache statistics for a scope.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `client_id` | string | required | Client identifier |
+| `workspace_id` | string | null | Filter by workspace |
 | `project_id` | string | null | Filter by project |
-| `namespace` | string | null | Filter by namespace |
 | `period` | string | `"24h"` | Stats period: `"1h"`, `"24h"`, `"7d"`, `"30d"` |
+
+> `application_id` and `client_id` are resolved from `AuthContext`.
 
 **Response:**
 
 ```json
 {
+  "application_id": "scicoms",
   "client_id": "acme-corp",
+  "workspace_id": "ws_01JKX...",
   "project_id": "customer-support",
   "period": "24h",
   "stats": {
@@ -1000,18 +1107,14 @@ Get cache statistics for a scope.
     "hit_rate": 0.745,
     "exact_hit_rate": 0.581,
     "semantic_hit_rate": 0.164,
-    "avg_exact_latency_ms": 3,
+    "avg_exact_latency_ms": 7,
     "avg_semantic_latency_ms": 85,
     "avg_miss_latency_ms": 92,
     "total_entries": 342,
-    "entries_by_namespace": {
-      "default": 280,
-      "faq": 62
-    },
     "estimated_cost_saved_usd": 22.76,
     "estimated_tokens_saved": {
-      "input": 1_234_500,
-      "output": 876_200
+      "input": 1234500,
+      "output": 876200
     }
   }
 }
@@ -1029,7 +1132,7 @@ Update cache configuration for a scope.
 
 ```json
 {
-  "client_id": "acme-corp",
+  "workspace_id": "ws_01JKX...",
   "project_id": "customer-support",
   "config": {
     "enabled": true,
@@ -1037,18 +1140,6 @@ Update cache configuration for a scope.
     "semantic_ttl_seconds": 3600,
     "similarity_threshold": 0.92,
     "max_entry_size_bytes": 102400,
-    "namespaces": {
-      "faq": {
-        "ttl_seconds": 604800,
-        "similarity_threshold": 0.90,
-        "semantic_enabled": true
-      },
-      "dynamic": {
-        "ttl_seconds": 900,
-        "similarity_threshold": 0.96,
-        "semantic_enabled": true
-      }
-    },
     "context_aware_caching": false,
     "event_driven_invalidation": true,
     "invalidation_events": [
@@ -1077,12 +1168,12 @@ All errors follow the platform standard format:
 | Error Code | HTTP Status | Description |
 |-----------|------------|-------------|
 | `INVALID_REQUEST` | 400 | Missing or invalid parameters |
-| `UNAUTHORIZED` | 401 | Invalid or missing API key |
+| `UNAUTHORIZED` | 401 | Invalid or missing credentials |
+| `FORBIDDEN` | 403 | Insufficient scopes for requested operation |
 | `CACHE_ENTRY_NOT_FOUND` | 404 | Referenced cache entry does not exist |
 | `CACHE_WRITE_FAILED` | 500 | Failed to write cache entry (DynamoDB failure) |
-| `EMBEDDING_ERROR` | 502 | Bedrock embedding generation failed |
+| `EMBEDDING_ERROR` | 502 | Model Gateway embedding generation failed |
 | `OPENSEARCH_ERROR` | 502 | OpenSearch unavailable or query failed |
-| `REDIS_ERROR` | 502 | Redis unavailable |
 | `CALLBACK_ERROR` | 502 | On-miss callback failed (for lookup-or-exec) |
 | `PURGE_REQUIRES_CONFIRM` | 400 | Purge request missing `confirm: true` |
 | `INTERNAL_ERROR` | 500 | Internal processing error |
@@ -1097,18 +1188,18 @@ All errors follow the platform standard format:
 CacheEntry
   │
   ├── identified by cache_entry_id (ULID)
-  ├── scoped to Client + Project + Namespace
+  ├── scoped to Application + Client + Workspace + Project
   │
   ├── contains:
   │     ├── query_normalized: original normalized query string
   │     ├── query_hash: SHA-256 hash for exact match
   │     ├── response: full cached response payload
   │     ├── citations: referenced document/chunk IDs
+  │     ├── guardrail_policy_version: string (policy version at cache write time)
   │     └── metadata: hit count, timestamps, original request info
   │
   ├── stored in:
-  │     ├── Redis (hot cache — exact match, fast TTL expiration)
-  │     ├── DynamoDB (durable store — full entry, audit trail)
+  │     ├── DynamoDB (primary store — exact match cache + durable record + audit trail)
   │     └── OpenSearch (semantic cache — embedding + metadata)
   │
   └── lifecycle:
@@ -1119,37 +1210,40 @@ CacheEntry
 
 CacheConfig
   │
-  ├── scoped to Client + Project
-  ├── contains: TTLs, thresholds, namespace configs, event subscriptions
+  ├── scoped to Application + Client + Workspace + Project
+  ├── contains: TTLs, thresholds, project configs, event subscriptions
   └── stored in: DynamoDB
 
 InvalidationEvent
   │
-  ├── scoped to Client + Project
+  ├── scoped to Application + Client
   ├── contains: criteria, entries affected, timestamp, source
   └── stored in: DynamoDB (audit trail)
 ```
 
 ### DynamoDB Table: `bold-cache-layer`
 
-Single-table design following platform conventions.
+Single-table design following platform conventions. Uses the Platform Context PK pattern.
 
 #### Cache Entry Entity
 
 ```
-PK: CLIENT#{client_id}
-SK: CACHE#{project_id}#{namespace}#{cache_entry_id}
+PK: APP#{application_id}#CLIENT#{client_id}
+SK: CACHE#WS#{workspace_id}#PROJ#{project_id}#{cache_entry_id}
 
 Attributes:
 - cache_entry_id: string (ULID)
+- application_id: string
+- client_id: string
+- workspace_id: string
 - project_id: string
-- namespace: string
 - query_normalized: string
 - query_hash: string (SHA-256)
 - response: Map (full cached response payload)
 - citations: List<Map> (referenced document/chunk IDs)
 - model: string (model that generated the response)
 - tokens_used: Map { input, output }
+- guardrail_policy_version: string
 - hit_count: integer
 - last_hit_at: string (ISO 8601)
 - created_at: string (ISO 8601)
@@ -1162,17 +1256,17 @@ Attributes:
 #### Cache Config Entity
 
 ```
-PK: CLIENT#{client_id}
-SK: CONFIG#{project_id}
+PK: APP#{application_id}#CLIENT#{client_id}
+SK: CONFIG#WS#{workspace_id}#PROJ#{project_id}
 
 Attributes:
+- workspace_id: string
 - project_id: string
 - enabled: boolean
 - default_ttl_seconds: integer
 - semantic_ttl_seconds: integer
 - similarity_threshold: number (0.0 – 1.0)
 - max_entry_size_bytes: integer
-- namespaces: Map<string, NamespaceConfig>
 - context_aware_caching: boolean
 - event_driven_invalidation: boolean
 - invalidation_events: List<string>
@@ -1183,11 +1277,12 @@ Attributes:
 #### Invalidation Event Entity
 
 ```
-PK: CLIENT#{client_id}
+PK: APP#{application_id}#CLIENT#{client_id}
 SK: INVAL#{timestamp}#{event_id}
 
 Attributes:
 - event_id: string (ULID)
+- workspace_id: string
 - project_id: string
 - source: "manual" | "event" | "ttl" | "purge"
 - criteria: Map (invalidation criteria)
@@ -1201,55 +1296,78 @@ Attributes:
 
 | GSI Name | PK | SK | Purpose |
 |----------|----|----|---------|
-| `GSI-QueryHash` | `CLIENT#{client_id}#HASH#{query_hash}` | `CACHE#{cache_entry_id}` | Fast exact match lookup (fallback when Redis misses) |
-| `GSI-ProjectNamespace` | `CLIENT#{client_id}#PROJECT#{project_id}` | `NAMESPACE#{namespace}#CREATED#{created_at}` | List entries by project + namespace |
-| `GSI-Citation` | `CLIENT#{client_id}#DOC#{document_id}` | `CACHE#{cache_entry_id}` | Find cache entries citing a specific document (for invalidation) |
-| `GSI-Stats` | `CLIENT#{client_id}#PROJECT#{project_id}` | `STATS#{period}#{timestamp}` | Cache statistics aggregation |
+| `GSI-QueryHash` | `APP#{application_id}#CLIENT#{client_id}#HASH#{query_hash}` | `CACHE#{cache_entry_id}` | Fast exact match lookup by query hash |
+| `GSI-ProjectEntries` | `APP#{application_id}#CLIENT#{client_id}#WS#{workspace_id}#PROJ#{project_id}` | `CREATED#{created_at}` | List entries by workspace + project |
+| `GSI-Citation` | `APP#{application_id}#CLIENT#{client_id}#DOC#{document_id}` | `CACHE#{cache_entry_id}` | Find cache entries citing a specific document (for invalidation) |
+| `GSI-Stats` | `APP#{application_id}#CLIENT#{client_id}#WS#{workspace_id}#PROJ#{project_id}` | `STATS#{period}#{timestamp}` | Cache statistics aggregation |
 
 ---
 
 ## Authentication & Authorization
 
-### API Key Authentication
+Authentication is handled by the shared Lambda Authorizer from the **Auth Block** (`boldsci-auth`). The Cache Layer consumes the authorizer and SDK per `constitution/platform-blocks.md`.
 
-Follows the Bold Platform standard:
+### Auth Block SDK Integration
+
+```python
+from boldsci.auth import get_auth_context, require_scope, AuthContext
+
+async def cache_lookup_handler(event, context):
+    # Extract AuthContext from shared Lambda Authorizer
+    auth: AuthContext = get_auth_context(event)
+    # auth.application_id → "scicoms"
+    # auth.client_id → "acme-corp"
+    # auth.scopes → ["cache:read", "cache:write"]
+    # auth.auth_method → "api_key" | "cognito_jwt" | "service_key"
+    # auth.key_id → "key_01JKX..."
+
+    # Enforce required scope
+    require_scope(auth, "cache:read")
+
+    # workspace_id and project_id from request body (not AuthContext)
+    body = json.loads(event["body"])
+    workspace_id = body["workspace_id"]
+    project_id = body["project_id"]
+```
+
+### Authorizer Attachment
+
+The shared Lambda Authorizer ARN is resolved via SSM at deploy time:
 
 ```
-Request Header: X-API-Key: <api-key-value>
-
-Validation:
-1. Look up key in shared `bold-api-keys` DynamoDB table
-2. Resolve client_id from key record
-3. Verify key status is "active"
-4. Verify client_id in request matches key's client_id
-5. Check key's allowed_services includes "cache-layer"
+/bold/auth/authorizer-arn
 ```
 
-### Cache Scope Authorization
+The Cache Layer's Terraform module references this parameter to attach the authorizer to its API Gateway. The Cache Layer does NOT deploy its own authorizer.
 
-The caller's API key determines which projects' caches they can access. A cache lookup for `project_id=hr-bot` will fail if the API key doesn't have access to that project.
+### Supported Auth Methods
 
-```
-1. API key resolves to client_id + access_scope
-2. access_scope contains: allowed_project_ids
-3. Verify requested project_id is in allowed_project_ids
-4. If not → 403 Forbidden
-```
+| Method | Header | Resolves | Use Case |
+|--------|--------|----------|----------|
+| API Key | `X-API-Key` | `application_id`, `client_id`, scopes | External API consumers |
+| Cognito JWT | `Authorization: Bearer <token>` | `client_id`, `user_id`, scopes | Web/mobile users (Admin UI) |
+| Service Key | `X-Service-Key` | calling service identity | Block-to-block calls (via SDK) |
 
-### Admin Operations
+### Required Scopes
 
-Purge and bulk invalidation operations require elevated permissions:
+| Endpoint | Required Scope |
+|----------|---------------|
+| `GET /health` | None (no auth) |
+| `POST /v1/cache/lookup` | `cache:read` |
+| `GET /v1/cache/stats` | `cache:read` |
+| `GET /v1/cache/config` | `cache:read` |
+| `POST /v1/cache/write` | `cache:write` |
+| `DELETE /v1/cache/entries/{id}` | `cache:write` |
+| `POST /v1/cache/invalidate` | `cache:write` |
+| `POST /v1/cache/purge` | `cache:admin` |
+| `PUT /v1/cache/config` | `cache:admin` |
 
-```json
-{
-  "api_key_permissions": {
-    "cache-layer:read": "lookup and stats",
-    "cache-layer:write": "write cache entries",
-    "cache-layer:invalidate": "single entry invalidation",
-    "cache-layer:admin": "bulk invalidation, purge, config changes"
-  }
-}
-```
+### Internal Calls
+
+When this block calls Model Gateway (for embedding generation), it uses the `boldsci-model-gateway` SDK, which handles:
+- `X-Service-Key` header for authentication
+- `X-Forwarded-Client-Id` header for quota attribution
+- Service discovery via SSM (`/bold/model-gateway/api-url`)
 
 ---
 
@@ -1257,35 +1375,45 @@ Purge and bulk invalidation operations require elevated permissions:
 
 ### Integration with Orchestration Block
 
-The primary integration pattern. The Orchestration block calls the Cache Layer before and after the Model Gateway:
+The primary integration pattern. The Cache Layer operates at Steps 2 and 8 of the canonical pipeline (see `platform-block-orchestration/ARCHITECTURE.md` § Canonical Pipeline Ordering):
 
 ```
-Orchestration Block:
-  1. Receive user request
-  2. Call Cache Layer POST /v1/cache/lookup
-  3. If status == "hit" → return cached response to user
-  4. If status == "miss" → proceed with full pipeline:
-     a. Call Retrieval Service (get context)
-     b. Call Prompt Library (assemble prompt)
-     c. Call Model Gateway (LLM inference)
-     d. Call Guardrails (output validation)
-  5. Call Cache Layer POST /v1/cache/write (cache the fresh response)
-  6. Return response to user
+Canonical Pipeline (Cache Layer's role):
+  Step 1. Guardrails Input Scan — PII redaction, injection detection
+          → produces sanitized_query + guardrail_policy_version
+  Step 2. Cache Layer lookup (via boldsci-cache-layer SDK)
+          → If HIT and policy version current → return cached response (skip 3-7)
+          → If HIT but policy version stale → treat as MISS
+          → If MISS → continue
+  Steps 3-6. [Retrieval → Prompt → Context → Model Gateway]
+  Step 7. Guardrails Output Scan
+          → If blocked → return safe fallback, do NOT cache
+  Step 8. Cache Layer write (via boldsci-cache-layer SDK)
+          → Store response + guardrail_policy_version
 ```
+
+> **Key**: Guardrails input scan (Step 1) MUST run before cache lookup (Step 2) because the user's query may contain PII that must be redacted before entering any cache index.
 
 ### Integration with Model Gateway
 
-The Model Gateway can optionally call the Cache Layer as inline middleware:
+The Cache Layer uses the `boldsci-model-gateway` SDK for embedding generation:
 
+```python
+from boldsci.model_gateway import ModelGatewayClient
+
+# SDK handles SSM discovery, auth headers, retry
+mg_client = ModelGatewayClient()
+response = mg_client.embed(
+    model="titan-embed-text",
+    input=normalized_query,
+    dimensions=1024,
+    normalize=True,
+    application_id=auth.application_id,
+    client_id=auth.client_id,
+)
 ```
-Model Gateway:
-  1. Receive LLM request
-  2. (Optional) Call Cache Layer lookup
-  3. If hit → return cached response (skip LLM)
-  4. If miss → invoke LLM provider
-  5. (Optional) Call Cache Layer write (cache response)
-  6. Return response
-```
+
+The Model Gateway can also optionally call the Cache Layer (via `boldsci-cache-layer` SDK) as inline middleware for LLM request deduplication.
 
 ### Integration with Doc Ingest (Event-Driven)
 
@@ -1298,7 +1426,7 @@ Doc Ingest publishes:
 Cache Layer consumes:
   1. Receive event
   2. Look up cache entries citing the affected document
-  3. Invalidate matching entries
+  3. Invalidate matching entries (mark as invalidated in DynamoDB, delete from OpenSearch)
 ```
 
 ### Integration with Guardrails Block
@@ -1307,23 +1435,64 @@ The Cache Layer respects guardrail verdicts:
 - Responses that received a "warn" or "block" verdict from Guardrails are NOT cached
 - If a cached response is later found to violate a new guardrail policy, the event-driven invalidation system purges it
 
-### Cache Layer Does NOT Call These Blocks
+### Cache Layer External Dependencies
 
 The Cache Layer is intentionally minimal in its downstream dependencies:
 
-| Block | Relationship |
-|-------|-------------|
-| **Model Gateway** | Cache Layer sits *in front of* — does not call |
-| **Retrieval Service** | Not called — cache stores full responses including citations |
-| **Conversation Manager** | Not called — caching is stateless, not session-aware |
-| **Prompt Library** | Not called — cache stores rendered responses, not prompts |
+| Dependency | How Consumed | Purpose |
+|-----------|-------------|---------|
+| **Model Gateway** | `boldsci-model-gateway` SDK | Query embedding generation via `embed()` |
+| **DynamoDB** | `boto3` via repository layer | Primary store — exact match cache, config, audit |
+| **OpenSearch** | `opensearch-py` client | Semantic similarity kNN search |
+| **EventBridge** | Lambda event source | Consuming invalidation events |
 
-The only external calls the Cache Layer makes are:
-1. **Bedrock** — for query embedding generation (semantic cache)
-2. **Redis** — for exact match cache operations
-3. **OpenSearch** — for semantic similarity search
-4. **DynamoDB** — for durable storage and configuration
-5. **EventBridge** — for consuming invalidation events
+---
+
+## Custom Domain & Service Discovery
+
+Per `constitution/platform-blocks.md` § Section 6, the Cache Layer is accessible via a stable custom domain.
+
+### Domain
+
+| Environment | Domain |
+|-------------|--------|
+| **dev** | `cache-layer-api.dev.boldquantum.com` |
+| **staging** | `cache-layer-api.staging.boldquantum.com` |
+| **prod** | `cache-layer-api.boldquantum.com` |
+
+### SSM Registration
+
+The Cache Layer registers its API URL at:
+
+```
+/bold/cache-layer/api-url
+```
+
+This allows the `boldsci-cache-layer` SDK and other blocks to discover the API at deploy time.
+
+### Shared Infrastructure References
+
+The Terraform module references shared DNS infrastructure via SSM:
+
+| SSM Parameter | Purpose |
+|--------------|---------|
+| `/bold/dns/{env}/hosted-zone-id` | Route 53 hosted zone ID |
+| `/bold/dns/{env}/wildcard-cert-arn` | ACM wildcard certificate ARN |
+| `/bold/auth/authorizer-arn` | Shared Lambda Authorizer ARN |
+
+### CORS Configuration
+
+Both API Gateway and FastAPI CORSMiddleware must be configured with identical origins:
+
+- **Dev:** `https://admin.dev.boldquantum.com` + `http://localhost:5173`
+- **Staging:** `https://admin.staging.boldquantum.com`
+- **Prod:** `https://admin.boldquantum.com`
+
+> **Important:** FastAPI + API Gateway deployments have two independent CORS layers that must stay in sync. Updating one without the other will cause preflight failures or missing CORS headers on responses.
+
+### OpenAPI Spec
+
+The FastAPI app generates an OpenAPI spec (`openapi.json`) that serves as the contract for the SDK and MCP Server. This spec is available at the `/openapi.json` endpoint.
 
 ---
 
@@ -1349,55 +1518,53 @@ The only external calls the Cache Layer makes are:
 │      └── Timeout: 60 seconds (bulk invalidation can be slow)                │
 │                                                                              │
 │  API                                                                         │
-│  └── API Gateway (REST)                                                      │
+│  └── API Gateway (HTTP API)                                                  │
+│      └── Custom domain: cache-layer-api.{env}.boldquantum.com              │
 │      └── Routes mapped to Lambda                                             │
-│      └── Request validation at gateway level                                 │
-│      └── WAF integration for DDoS protection                                │
-│                                                                              │
-│  Caching                                                                     │
-│  └── Amazon ElastiCache (Redis 7.x, cluster mode)                           │
-│      └── Node type: cache.r7g.large (13 GB memory)                          │
-│      └── Cluster mode: enabled (for horizontal scaling)                      │
-│      └── Encryption at rest + in transit                                     │
-│      └── Multi-AZ with automatic failover                                   │
-│      └── maxmemory-policy: allkeys-lru                                      │
-│      └── VPC deployment (same VPC as Lambda)                                │
+│      └── Shared Lambda Authorizer attached (SSM: /bold/auth/authorizer-arn) │
+│      └── CORS configured for admin UI domains                               │
 │                                                                              │
 │  Storage                                                                     │
 │  └── DynamoDB                                                                │
 │      └── Table: bold-cache-layer                                             │
+│      └── PK: APP#{application_id}#CLIENT#{client_id}                        │
 │      └── On-demand capacity (burst-friendly)                                 │
 │      └── Point-in-time recovery enabled                                      │
 │      └── TTL enabled (cache entry and audit retention)                      │
 │                                                                              │
 │  Search                                                                      │
-│  └── OpenSearch Serverless                                                   │
-│      └── Collection: bold-semantic-cache                                     │
-│      └── Index: semantic-cache-{env}                                        │
-│      └── Vector engine: HNSW with cosine similarity                         │
+│  └── OpenSearch (Provisioned)                                                │
+│      └── Instance: t3.small.search (~$25/month)                             │
+│      └── Cache Layer provisions the shared domain                            │
+│      └── Endpoint registered at SSM: /bold/opensearch/domain-endpoint       │
+│      └── Index: bold-semantic-cache (owned by Cache Layer)                   │
+│      └── Vector engine: HNSW with cosine similarity, 1024 dimensions        │
 │      └── Used exclusively for semantic cache kNN lookups                    │
 │                                                                              │
 │  AI/ML                                                                       │
-│  └── AWS Bedrock                                                             │
-│      └── Titan Embed v2 (query embedding for semantic cache)                │
-│      └── Dimension: 1024                                                     │
+│  └── Model Gateway (via boldsci-model-gateway SDK)                          │
+│      └── Query embedding for semantic cache                                 │
+│      └── Routes to Titan Embed v2, Dimension: 1024                          │
 │                                                                              │
 │  Events                                                                      │
 │  └── Amazon EventBridge                                                      │
 │      └── Subscribes to: bold.doc-ingest, bold.model-gateway events         │
 │      └── Triggers invalidation Lambda                                        │
 │                                                                              │
-│  Networking                                                                  │
-│  └── VPC                                                                     │
-│      └── Lambda functions deployed in VPC (required for ElastiCache)        │
-│      └── VPC endpoints for DynamoDB, Bedrock, OpenSearch                    │
-│      └── NAT Gateway for EventBridge, API Gateway                           │
+│  DNS                                                                         │
+│  └── Route 53                                                                │
+│      └── A (alias) record: cache-layer-api.{env}.boldquantum.com           │
+│      └── Points to API Gateway custom domain                                │
+│      └── Uses shared hosted zone from SSM                                   │
 │                                                                              │
 │  Monitoring                                                                  │
 │  └── CloudWatch                                                              │
-│      └── Metrics: hit rate, latency, invalidation rate, Redis memory        │
-│      └── Alarms: low hit rate, high miss rate, Redis memory pressure        │
-│      └── Logs: structured JSON logging                                       │
+│      └── Metrics: hit rate, latency, invalidation rate                      │
+│      └── Alarms: low hit rate, high miss rate, high latency                 │
+│      └── Logs: structured JSON logging (structlog)                          │
+│  └── ADOT (AWS Distro for OpenTelemetry)                                    │
+│      └── X-Ray tracing on all Lambda functions                              │
+│      └── FastAPIInstrumentor, BotocoreInstrumentor                          │
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -1406,65 +1573,107 @@ The only external calls the Cache Layer makes are:
 
 | Function | Memory | Timeout | Purpose |
 |----------|--------|---------|---------|
-| cache-api | 512 MB | 30s | Main API (lookup, write, invalidate, stats) |
+| cache-api | 512 MB | 30s | Main API (lookup, write, invalidate, stats, health) |
 | cache-event-handler | 256 MB | 60s | EventBridge invalidation event consumer |
 | cache-stats-aggregator | 256 MB | 120s | Periodic stats aggregation (CloudWatch scheduled) |
 
-### SAM Template Structure
+### Project Structure (Terraform + uv)
 
 ```
 platform-block-cache-layer/
 ├── ARCHITECTURE.md
-├── template.yaml                    # SAM template
-├── samconfig.toml                   # Deploy configuration
-├── pyproject.toml                   # Poetry dependencies
-├── src/
-│   ├── handlers/
-│   │   ├── lookup.py                # POST /v1/cache/lookup
-│   │   ├── write.py                 # POST /v1/cache/write
-│   │   ├── lookup_or_exec.py        # POST /v1/cache/lookup-or-exec
-│   │   ├── invalidate.py            # DELETE + POST invalidation endpoints
-│   │   ├── purge.py                 # POST /v1/cache/purge
-│   │   ├── stats.py                 # GET /v1/cache/stats
-│   │   ├── config.py                # GET + PUT /v1/cache/config
-│   │   └── event_handler.py         # EventBridge event consumer
-│   ├── core/
-│   │   ├── pipeline.py              # Cache lookup pipeline orchestration
-│   │   ├── exact_match.py           # Exact match caching logic
-│   │   ├── semantic_match.py        # Semantic similarity caching logic
-│   │   ├── normalizer.py            # Query normalization
-│   │   ├── cache_writer.py          # Write pipeline (Redis + DynamoDB + OpenSearch)
-│   │   ├── invalidator.py           # Invalidation logic
-│   │   └── stats_engine.py          # Statistics aggregation
-│   ├── models/
-│   │   ├── request.py               # Request schemas (Pydantic)
-│   │   ├── response.py              # Response schemas
-│   │   ├── cache_entry.py           # Cache entry data model
-│   │   └── config.py                # Cache config data model
-│   ├── auth/
-│   │   ├── api_key.py               # API key validation
-│   │   └── access_scope.py          # Permission resolution
-│   └── clients/
-│       ├── redis_client.py          # ElastiCache Redis connection + operations
-│       ├── opensearch_client.py     # OpenSearch connection + kNN queries
-│       ├── bedrock_client.py        # Bedrock embedding generation
-│       ├── dynamodb_client.py       # DynamoDB operations
-│       └── eventbridge_client.py    # EventBridge event consumption
+├── pyproject.toml                    # uv (package management)
+├── uv.lock                           # Locked dependencies (committed)
+├── terraform/                        # Terraform (infrastructure)
+│   ├── main.tf                       # Provider, backend, data sources
+│   ├── variables.tf                  # Input variables (env, etc.)
+│   ├── outputs.tf                    # Output values
+│   ├── lambda.tf                     # Lambda functions + layers
+│   ├── dynamodb.tf                   # DynamoDB table + GSIs
+│   ├── opensearch.tf                 # Provisioned OpenSearch domain
+│   ├── api-gateway.tf                # API Gateway + custom domain + CORS
+│   ├── eventbridge.tf                # EventBridge rules + targets
+│   └── ssm.tf                        # SSM parameter registration
+├── src/                              # API code
+│   ├── main.py                       # FastAPI app, router registration, Mangum handler
+│   ├── common/                       # Shared utilities, base classes
+│   │   ├── exceptions.py             # Domain exception hierarchy (AppError → ...)
+│   │   ├── dependencies.py           # Shared FastAPI dependencies (auth, DynamoDB, settings)
+│   │   ├── middleware.py             # Cross-cutting middleware
+│   │   └── base_models.py           # Pydantic ApiModel base with camelCase
+│   ├── cache/                        # Cache domain module
+│   │   ├── router.py                 # FastAPI router — thin, delegates to service
+│   │   ├── dependencies.py           # get_cache_service, get_cache_repository
+│   │   ├── service.py                # Cache lookup/write pipeline orchestration
+│   │   ├── repository.py             # DynamoDB operations (exact match, config, audit)
+│   │   ├── schemas.py                # Request/response Pydantic models
+│   │   ├── models.py                 # CacheEntryModel, CacheConfigModel
+│   │   └── exceptions.py             # Cache-specific exceptions
+│   ├── semantic/                     # Semantic similarity domain module
+│   │   ├── service.py                # Semantic lookup/write logic
+│   │   ├── repository.py             # OpenSearch kNN operations
+│   │   └── schemas.py                # Semantic-specific models
+│   ├── invalidation/                 # Invalidation domain module
+│   │   ├── router.py                 # Invalidation/purge endpoints
+│   │   ├── service.py                # Invalidation logic
+│   │   ├── event_handler.py          # EventBridge event consumer (Lambda entry point)
+│   │   └── schemas.py                # Invalidation request/response models
+│   ├── stats/                        # Statistics domain module
+│   │   ├── router.py                 # Stats/config endpoints
+│   │   ├── service.py                # Stats aggregation logic
+│   │   └── schemas.py                # Stats models
+│   └── clients/                      # External service clients
+│       ├── opensearch_client.py      # OpenSearch connection + kNN queries
+│       └── model_gateway_client.py   # Wrapper around boldsci-model-gateway SDK
+├── sdk/                              # boldsci-cache-layer (Python SDK)
+│   ├── pyproject.toml
+│   ├── src/
+│   │   └── boldsci/
+│   │       └── cache_layer/
+│   │           ├── __init__.py
+│   │           ├── client.py         # CacheLayerClient — typed API wrapper
+│   │           ├── models.py         # Pydantic request/response models
+│   │           └── exceptions.py     # SDK exceptions
+│   └── tests/
+├── ui/                               # @boldscience/admin-cache-layer (Admin UI Package)
+│   ├── src/
+│   │   ├── components/               # Block-specific components
+│   │   ├── pages/                    # Page components for platform-block-admin
+│   │   ├── hooks/                    # TanStack Query hooks for cache API
+│   │   ├── types/                    # TypeScript interfaces + Zod schemas
+│   │   ├── routes.ts                 # Route definitions for shell
+│   │   ├── nav.ts                    # Navigation metadata
+│   │   └── index.ts                  # Package entry point
+│   ├── .storybook/
+│   ├── package.json
+│   ├── tsconfig.json
+│   └── tsup.config.ts
+├── mcp/                              # bold-cache-layer-mcp (MCP Server)
+│   ├── src/
+│   │   ├── server.py                 # MCP server definition
+│   │   ├── tools.py                  # Tools mapping to cache API operations
+│   │   └── resources.py              # Resources for inspecting cache state
+│   └── pyproject.toml
 └── tests/
-    ├── unit/
-    │   ├── test_normalizer.py
-    │   ├── test_exact_match.py
-    │   ├── test_semantic_match.py
-    │   ├── test_pipeline.py
-    │   ├── test_invalidator.py
-    │   └── test_cache_writer.py
+    ├── cache/
+    │   ├── test_service.py
+    │   ├── test_repository.py
+    │   └── test_router.py
+    ├── semantic/
+    │   ├── test_service.py
+    │   └── test_repository.py
+    ├── invalidation/
+    │   ├── test_service.py
+    │   └── test_event_handler.py
+    ├── stats/
+    │   └── test_service.py
     ├── integration/
-    │   ├── test_redis_operations.py
     │   ├── test_opensearch_operations.py
     │   └── test_end_to_end.py
-    └── fixtures/
-        ├── sample_queries.json
-        └── sample_responses.json
+    ├── fixtures/
+    │   ├── sample_queries.json
+    │   └── sample_responses.json
+    └── conftest.py
 ```
 
 ---
@@ -1480,27 +1689,22 @@ The Cache Layer is on the critical path for every AI request. If it fails, the r
 │                      DEGRADATION STRATEGY                                    │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                              │
-│  Scenario: Redis unavailable                                                 │
-│  └── Strategy: Skip exact match, fall through to semantic                    │
-│      └── If semantic also fails → return cache miss                          │
+│  Scenario: DynamoDB unavailable                                              │
+│  └── Strategy: Return cache miss                                             │
+│      └── Both exact match and durable writes fail                           │
 │      └── Caller proceeds to Model Gateway normally                           │
-│      └── Log degraded mode for monitoring                                    │
+│      └── Log critical degradation                                            │
 │                                                                              │
 │  Scenario: OpenSearch unavailable                                            │
 │  └── Strategy: Skip semantic lookup, rely on exact match only               │
-│      └── Exact match (Redis) still provides value                           │
+│      └── Exact match (DynamoDB) still provides value                        │
 │      └── Semantic cache writes queued for retry                              │
 │      └── Log degraded mode                                                   │
 │                                                                              │
-│  Scenario: Bedrock unavailable (embedding generation)                       │
+│  Scenario: Model Gateway unavailable (embedding generation)                 │
 │  └── Strategy: Skip semantic lookup and write                               │
 │      └── Exact match still works                                             │
 │      └── Log embedding failure                                               │
-│                                                                              │
-│  Scenario: DynamoDB unavailable                                              │
-│  └── Strategy: Serve from Redis (stale cache better than no cache)          │
-│      └── Cache writes fail — responses not persisted                         │
-│      └── Log critical degradation                                            │
 │                                                                              │
 │  Scenario: Full Cache Layer outage                                           │
 │  └── Strategy: Caller treats as cache miss                                   │
@@ -1514,9 +1718,36 @@ The Cache Layer is on the critical path for every AI request. If it fails, the r
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
+### Domain Exception Hierarchy
+
+Per `constitution/coding-standards.md`, the Cache Layer uses a domain exception hierarchy:
+
+```python
+class AppError(Exception):
+    """Base application error."""
+    status_code: int = 500
+    code: str = "INTERNAL_ERROR"
+
+class NotFoundError(AppError):
+    status_code = 404
+    code = "CACHE_ENTRY_NOT_FOUND"
+
+class ValidationError(AppError):
+    status_code = 400
+    code = "INVALID_REQUEST"
+
+class AuthorizationError(AppError):
+    status_code = 403
+    code = "FORBIDDEN"
+
+class ExternalServiceError(AppError):
+    status_code = 502
+    # code varies: EMBEDDING_ERROR, OPENSEARCH_ERROR, CALLBACK_ERROR
+```
+
 ### Circuit Breaker Pattern
 
-External dependencies (Redis, OpenSearch, Bedrock) are wrapped with circuit breakers:
+External dependencies (OpenSearch, Model Gateway) are wrapped with circuit breakers:
 
 - **Closed** (normal): Requests pass through
 - **Open** (after 5 consecutive failures): Requests fail fast, return cache miss immediately
@@ -1530,25 +1761,23 @@ External dependencies (Redis, OpenSearch, Bedrock) are wrapped with circuit brea
 
 | Operation | Target P50 | Target P99 | Notes |
 |-----------|-----------|-----------|-------|
-| Exact match hit | < 3ms | < 10ms | Redis GET, single operation |
-| Exact match miss | < 5ms | < 15ms | Redis GET (not found) |
+| Exact match hit | < 7ms | < 15ms | DynamoDB GetItem, single operation |
+| Exact match miss | < 10ms | < 20ms | DynamoDB GetItem (not found) |
 | Semantic hit | < 80ms | < 200ms | Embedding + OpenSearch kNN |
 | Semantic miss | < 100ms | < 250ms | Embedding + OpenSearch kNN (no result) |
 | Full lookup (exact miss + semantic miss) | < 100ms | < 250ms | Both tiers, no hit |
-| Cache write | < 50ms | < 150ms | Parallel Redis + DynamoDB + OpenSearch |
+| Cache write | < 50ms | < 150ms | Parallel DynamoDB + OpenSearch |
 | Lookup-or-exec (hit) | < 100ms | < 250ms | Same as lookup |
 | Lookup-or-exec (miss) | Depends on callback | — | Dominated by LLM latency |
 
 ### Optimization Strategies
 
-1. **Redis first, always**: Exact match in Redis is O(1) lookup — always check first
-2. **Parallel writes**: Redis, DynamoDB, and OpenSearch writes happen concurrently via `asyncio.gather()`
-3. **Embedding cache**: Cache query embeddings in Redis for 15 minutes to avoid re-embedding identical queries
-4. **Connection pooling**: Persistent connections to Redis, OpenSearch, and DynamoDB across Lambda invocations
-5. **VPC endpoint routing**: DynamoDB, Bedrock, and OpenSearch traffic stays within AWS network (no internet hop)
-6. **Provisioned concurrency**: 10 warm Lambda instances to eliminate cold starts on the hot path
-7. **Redis pipelining**: Batch multiple Redis operations in a single round-trip when possible
-8. **OpenSearch pre-filtering**: Tenant and scope filters applied at the engine level, not post-filter
+1. **DynamoDB GetItem first, always**: Exact match is O(1) lookup via GSI — always check first
+2. **Parallel writes**: DynamoDB and OpenSearch writes happen concurrently via `asyncio.gather()`
+3. **Connection pooling**: Persistent connections to OpenSearch and DynamoDB across Lambda invocations
+4. **Provisioned concurrency**: 10 warm Lambda instances to eliminate cold starts on the hot path
+5. **OpenSearch pre-filtering**: Tenant and scope filters applied at the engine level, not post-filter
+6. **DynamoDB DAX** (future): If exact match latency becomes critical, add DAX for sub-millisecond reads
 
 ### Scaling Characteristics
 
@@ -1562,26 +1791,20 @@ External dependencies (Redis, OpenSearch, Bedrock) are wrapped with circuit brea
 │      └── Provisioned concurrency: 10 (hot path)                             │
 │      └── Reserved concurrency: 200 (protect downstream)                     │
 │                                                                              │
-│  ElastiCache Redis                                                           │
-│  └── Cluster mode with read replicas                                         │
-│      └── Reads scale horizontally via replicas                               │
-│      └── Writes scale via sharding (cluster mode)                           │
-│      └── Memory: monitor and scale node type as cache grows                 │
-│                                                                              │
 │  DynamoDB                                                                    │
 │  └── On-demand capacity — scales with read/write volume                      │
+│      └── Cache reads: GetItem on every exact match lookup                   │
 │      └── Cache writes: one per cache miss                                    │
-│      └── Cache reads: only on Redis miss (fallback)                         │
 │      └── Config reads: cached in Lambda memory                               │
 │                                                                              │
-│  OpenSearch Serverless                                                       │
-│  └── Automatic scaling based on query volume and index size                 │
-│      └── OCU min: 2 (cost optimization)                                     │
-│      └── OCU max: 10 (scale ceiling)                                        │
+│  OpenSearch (Provisioned)                                                    │
+│  └── t3.small.search for initial deployment                                  │
+│      └── Scale to t3.medium.search or larger as index grows                 │
+│      └── Monitor JVM memory and CPU utilization                             │
+│      └── Only used for semantic lookups (not exact matches)                 │
 │                                                                              │
-│  Bedrock (Titan Embed)                                                       │
-│  └── Managed service — scales automatically                                  │
-│      └── Rate limit: 50 TPS (request increase if needed)                    │
+│  Model Gateway (via boldsci-model-gateway SDK)                              │
+│  └── Embedding generation scales via Model Gateway rate limits              │
 │      └── Only called on semantic lookups (not exact matches)                │
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -1607,15 +1830,166 @@ At 1000 cache hits/day:
   = ~$7.10/day saved
   = ~$213/month saved
 
-Minus cache infrastructure cost:
-  Redis (cache.r7g.large): ~$200/month
-  OpenSearch Serverless (2 OCU): ~$350/month
+Cache infrastructure cost:
+  OpenSearch (t3.small.search): ~$25/month
   Lambda + DynamoDB: ~$50/month
-  Total cache cost: ~$600/month
+  Total cache cost: ~$75/month
 
-Break-even: ~2,800 cache hits/day
+Break-even: ~350 cache hits/day
   (After break-even, every additional hit is pure savings)
 ```
+
+---
+
+## SDK (`boldsci-cache-layer`)
+
+Per `constitution/platform-blocks.md` § Section 3, the Cache Layer ships a typed Python SDK for block-to-block and application-to-block consumption.
+
+### Package
+
+- **PyPI package:** `boldsci-cache-layer`
+- **Python import:** `from boldsci.cache_layer import CacheLayerClient`
+- **Published to:** AWS CodeArtifact (private PyPI registry)
+
+### Client Interface
+
+```python
+from boldsci.cache_layer import CacheLayerClient, LookupConfig
+
+client = CacheLayerClient()
+
+# Cache lookup
+result = client.lookup(
+    workspace_id="ws_01JKX...",
+    project_id="customer-support",
+    query="How do I reset my password?",
+    lookup_config=LookupConfig(
+        enable_exact_match=True,
+        enable_semantic=True,
+        similarity_threshold=0.92,
+    ),
+    application_id=auth.application_id,
+    client_id=auth.client_id,
+)
+
+if result.status == "hit":
+    return result.response
+
+# Cache write
+client.write(
+    workspace_id="ws_01JKX...",
+    project_id="customer-support",
+    query="How do I reset my password?",
+    response=llm_response,
+    application_id=auth.application_id,
+    client_id=auth.client_id,
+)
+```
+
+### What the SDK Provides
+
+- Typed `CacheLayerClient` wrapping all API endpoints
+- Pydantic request/response models
+- Service discovery via SSM (`/bold/cache-layer/api-url`)
+- Auth header injection (`X-Service-Key` + `X-Forwarded-Client-Id`)
+- Retry and error handling
+
+### What the SDK Does NOT Do
+
+- No business logic
+- No direct DynamoDB, OpenSearch, or any other data store access
+- The SDK is a thin HTTP client over the Cache Layer API
+
+---
+
+## Admin UI Package (`@boldscience/admin-cache-layer`)
+
+Per `constitution/platform-blocks.md` § Section 4, the Cache Layer ships an admin UI package consumed by `platform-block-admin`.
+
+### Package
+
+- **npm package:** `@boldscience/admin-cache-layer`
+- **Import:** `import { CacheDashboardPage, useCacheStats } from '@boldscience/admin-cache-layer'`
+- **Published to:** GitHub Packages (`npm.pkg.github.com`)
+
+### Location
+
+Lives in the `ui/` directory of this repo (see Project Structure above).
+
+### Exported Surfaces
+
+| Export | Description |
+|--------|-------------|
+| `CacheDashboardPage` | Overview dashboard: hit rate, latency, cost savings, entry counts |
+| `CacheEntriesPage` | Browse and search cache entries by scope |
+| `CacheConfigPage` | View and edit per-project cache configuration |
+| `CacheInvalidationPage` | Manual invalidation and purge operations |
+| `useCacheStats` | TanStack Query hook for `GET /v1/cache/stats` |
+| `useCacheEntries` | TanStack Query hook for listing cache entries |
+| `useCacheConfig` / `useUpdateCacheConfig` | Query/mutation hooks for config |
+| `useInvalidateCache` / `usePurgeCache` | Mutation hooks for invalidation |
+| Route definitions | Route config for shell mounting at `/cache-layer/*` |
+| Navigation metadata | Label: "Cache Layer", icon, ordering |
+
+### Tech Stack
+
+React, TypeScript, Tailwind, `@boldscience/ui` (shadcn/ui components), TanStack Query, Zod. Follows `constitution/frontend-standards.md`.
+
+### Peer Dependencies
+
+```json
+{
+  "peerDependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "@tanstack/react-query": "^5.0.0",
+    "@tanstack/react-router": "^1.0.0",
+    "zod": "^3.0.0",
+    "tailwindcss": "^4.0.0",
+    "@boldscience/ui": "^1.0.0"
+  }
+}
+```
+
+---
+
+## MCP Server (`bold-cache-layer-mcp`)
+
+Per `constitution/platform-blocks.md` § Section 5, the Cache Layer exposes an MCP server for AI agent interaction.
+
+### What It Exposes
+
+**Tools:**
+
+| Tool | Maps To | Description |
+|------|---------|-------------|
+| `cache_lookup` | `POST /v1/cache/lookup` | Check cache for a query |
+| `cache_write` | `POST /v1/cache/write` | Write a response to cache |
+| `cache_invalidate` | `POST /v1/cache/invalidate` | Bulk invalidate cache entries |
+| `cache_purge` | `POST /v1/cache/purge` | Purge all cache for a scope |
+| `cache_stats` | `GET /v1/cache/stats` | Get cache statistics |
+| `cache_config_get` | `GET /v1/cache/config` | Get cache configuration |
+| `cache_config_update` | `PUT /v1/cache/config` | Update cache configuration |
+
+**Resources:**
+
+| Resource | Description |
+|----------|-------------|
+| `cache://stats/{workspace_id}/{project_id}` | Cache statistics for a project |
+| `cache://config/{workspace_id}/{project_id}` | Cache configuration for a project |
+| `cache://health` | Service health status |
+
+### Backend
+
+The MCP server consumes the Cache Layer API via the `boldsci-cache-layer` SDK. No direct database access.
+
+### Auth
+
+Authenticates to the Cache Layer API using a service key. Tenant context is forwarded from the agent's session.
+
+### Registration
+
+Documented in `bold-spec/mcp/`. The Cache Layer repo maintains the MCP server implementation.
 
 ---
 
@@ -1625,31 +1999,41 @@ Break-even: ~2,800 cache hits/day
 
 **Goal:** Fast, hash-based caching for identical queries.
 
-- Project scaffolding (SAM template, Poetry, project structure)
+- Project scaffolding (Terraform, uv, domain-driven project structure)
 - Query normalization logic
-- SHA-256 hash-based cache key construction
-- Redis client with connection pooling (VPC deployment)
+- SHA-256 hash-based cache key construction with `application_id` + `client_id` + `workspace_id` + `project_id`
+- DynamoDB table setup (`bold-cache-layer`) with Platform Context PK pattern
+- DynamoDB repository: exact match GetItem via GSI-QueryHash
 - POST /v1/cache/lookup (exact match only)
-- POST /v1/cache/write
-- DynamoDB table setup (cache entries, config)
-- API key authentication via shared `bold-api-keys` table
-- TTL-based expiration (Redis native + DynamoDB TTL)
+- POST /v1/cache/write (DynamoDB only)
+- GET /health endpoint (no auth)
+- `boldsci-auth` SDK integration for AuthContext resolution
+- Shared Lambda Authorizer attachment (SSM: `/bold/auth/authorizer-arn`)
+- TTL-based expiration (DynamoDB TTL)
 - Basic DELETE /v1/cache/entries/{id}
-- Request/response Pydantic models
-- Unit tests with moto (DynamoDB) and fakeredis
+- Request/response Pydantic models (`ApiModel` base with camelCase aliases)
+- Domain exception hierarchy (`AppError` → `NotFoundError`, etc.)
+- Custom domain setup (`cache-layer-api.{env}.boldquantum.com`)
+- SSM registration (`/bold/cache-layer/api-url`)
+- CORS configuration for admin UI domains
+- structlog JSON logging with required fields
+- Unit tests with moto (DynamoDB)
 
 ### Phase 2: Semantic Similarity Caching
 
 **Goal:** Embedding-based lookup for paraphrased queries.
 
-- Bedrock Titan Embed v2 integration for query embedding
-- OpenSearch Serverless setup (semantic cache index)
-- kNN similarity search with tenant-scoped filtering
+- `boldsci-model-gateway` SDK integration for embedding generation
+- Provisioned OpenSearch domain setup (t3.small.search)
+- OpenSearch domain endpoint registration in SSM (`/bold/opensearch/domain-endpoint`)
+- Semantic cache index (`bold-semantic-cache`) with kNN mapping
+- kNN similarity search with tenant-scoped filtering (`application_id` + `client_id` + `workspace_id` + `project_id`)
 - Configurable similarity threshold
 - Semantic cache write (embedding stored in OpenSearch)
 - POST /v1/cache/lookup updated for two-tier pipeline (exact → semantic)
-- Embedding caching in Redis (avoid re-embedding)
-- Graceful degradation (skip semantic when Bedrock/OpenSearch unavailable)
+- Graceful degradation (skip semantic when Model Gateway/OpenSearch unavailable)
+- Circuit breaker for external dependencies
+- ADOT instrumentation (FastAPIInstrumentor, BotocoreInstrumentor)
 - Integration tests against OpenSearch
 
 ### Phase 3: Cache Invalidation & Configuration
@@ -1658,12 +2042,11 @@ Break-even: ~2,800 cache hits/day
 
 - POST /v1/cache/invalidate (bulk invalidation by criteria)
 - POST /v1/cache/purge (full scope purge)
-- EventBridge integration (subscribe to Doc Ingest, Model Gateway events)
+- EventBridge integration (subscribe to Doc Ingest, Model Gateway, Guardrails events)
 - Event-driven invalidation Lambda
 - Citation-based invalidation (invalidate entries citing updated documents)
 - GET/PUT /v1/cache/config (per-project configuration)
-- Namespace support (independent TTL and thresholds per namespace)
-- Circuit breaker for external dependencies
+- Guardrail policy version tracking on cache entries
 
 ### Phase 4: Advanced Features
 
@@ -1674,22 +2057,28 @@ Break-even: ~2,800 cache hits/day
 - Stats aggregation Lambda (periodic CloudWatch-scheduled)
 - Cost savings estimation (tokens saved × model pricing)
 - Context-aware caching (hash system prompt + retrieval context)
-- Admin permissions for purge/bulk operations
+- Admin permissions for purge/bulk operations (`cache:admin` scope)
 - DynamoDB GSI for citation-based lookups
+- OpenAPI spec generation and publishing
 
-### Phase 5: Optimization & Observability
+### Phase 5: Artifacts (SDK, Admin UI, MCP Server)
+
+**Goal:** Ship all four required artifacts per `constitution/platform-blocks.md`.
+
+- **SDK** (`boldsci-cache-layer`): Typed Python client, SSM-based service discovery, published to CodeArtifact
+- **Admin UI Package** (`@boldscience/admin-cache-layer`): React components, TanStack Query hooks, Storybook, published to GitHub Packages
+- **MCP Server** (`bold-cache-layer-mcp`): Tools and resources mapping to cache API, documented in `bold-spec/mcp/`
+
+### Phase 6: Optimization & Observability
 
 **Goal:** Performance tuning, monitoring, and production readiness.
 
 - Provisioned concurrency tuning
-- Redis cluster mode configuration
-- Redis pipelining for batch operations
 - CloudWatch metrics and dashboards
-- Alerting (low hit rate, Redis memory pressure, high latency)
+- Alerting (low hit rate, high latency, write failures)
 - Latency breakdown logging (per-stage timing)
-- Cost attribution per client
+- Cost attribution per application + client
 - Load testing and P99 optimization
-- VPC endpoint configuration for all AWS services
 
 ---
 
@@ -1701,14 +2090,13 @@ Break-even: ~2,800 cache hits/day
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │ PK                                    │ SK                                    │
 ├───────────────────────────────────────┼───────────────────────────────────────┤
-│ CLIENT#acme-corp                      │ CACHE#customer-support#default#01JKX..│
-│ CLIENT#acme-corp                      │ CACHE#customer-support#faq#01JKX...   │
-│ CLIENT#acme-corp                      │ CACHE#hr-bot#default#01JKX...         │
-│ CLIENT#acme-corp                      │ CONFIG#customer-support               │
-│ CLIENT#acme-corp                      │ CONFIG#hr-bot                         │
-│ CLIENT#acme-corp                      │ INVAL#2026-02-10T15:00:00Z#01JKX...  │
-│ CLIENT#beta-inc                       │ CACHE#support#default#01JKX...        │
-│ CLIENT#beta-inc                       │ CONFIG#support                        │
+│ APP#scicoms#CLIENT#acme-corp          │ CACHE#WS#ws_01JK..#PROJ#cust-sup#01..│
+│ APP#scicoms#CLIENT#acme-corp          │ CACHE#WS#ws_01JK..#PROJ#hr-bot#01..  │
+│ APP#scicoms#CLIENT#acme-corp          │ CONFIG#WS#ws_01JK..#PROJ#cust-sup    │
+│ APP#scicoms#CLIENT#acme-corp          │ CONFIG#WS#ws_01JK..#PROJ#hr-bot      │
+│ APP#scicoms#CLIENT#acme-corp          │ INVAL#2026-02-10T15:00:00Z#01JKX...  │
+│ APP#boldpubs#CLIENT#beta-inc          │ CACHE#WS#ws_02AB..#PROJ#support#01.. │
+│ APP#boldpubs#CLIENT#beta-inc          │ CONFIG#WS#ws_02AB..#PROJ#support     │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -1716,10 +2104,10 @@ Break-even: ~2,800 cache hits/day
 
 | Access Pattern | GSI | Query |
 |---------------|-----|-------|
-| Exact match lookup (DynamoDB fallback) | `GSI-QueryHash` | PK=`CLIENT#X#HASH#Y` |
-| List entries by project + namespace | `GSI-ProjectNamespace` | PK=`CLIENT#X#PROJECT#Y`, SK begins_with `NAMESPACE#Z` |
-| Find entries citing a document | `GSI-Citation` | PK=`CLIENT#X#DOC#Y` |
-| Cache statistics | `GSI-Stats` | PK=`CLIENT#X#PROJECT#Y`, SK begins_with `STATS#` |
+| Exact match lookup (query hash) | `GSI-QueryHash` | PK=`APP#X#CLIENT#Y#HASH#Z` |
+| List entries by workspace + project | `GSI-ProjectEntries` | PK=`APP#X#CLIENT#Y#WS#W#PROJ#P`, SK begins_with `CREATED#` |
+| Find entries citing a document | `GSI-Citation` | PK=`APP#X#CLIENT#Y#DOC#D` |
+| Cache statistics | `GSI-Stats` | PK=`APP#X#CLIENT#Y#WS#W#PROJ#P`, SK begins_with `STATS#` |
 
 ---
 
@@ -1738,10 +2126,16 @@ def normalize_query(query: str) -> str:
     query = re.sub(r'[?!.]+$', '?', query)
     return query
 
-def compute_cache_key(client_id: str, project_id: str, namespace: str, query: str) -> str:
+def compute_cache_key(
+    application_id: str,
+    client_id: str,
+    workspace_id: str,
+    project_id: str,
+    query: str,
+) -> str:
     normalized = normalize_query(query)
     query_hash = hashlib.sha256(normalized.encode('utf-8')).hexdigest()
-    return f"{client_id}:{project_id}:{namespace}:{query_hash}"
+    return f"{application_id}:{client_id}:{workspace_id}:{project_id}:{query_hash}"
 ```
 
 ### Cosine Similarity
@@ -1753,7 +2147,7 @@ from numpy.linalg import norm
 def cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot(a, b) / (norm(a) * norm(b))
 
-# Threshold: 0.92 default (configurable per client/project/namespace)
+# Threshold: 0.92 default (configurable per client/project)
 # Above threshold → semantic cache hit
 # Below threshold → cache miss
 ```
@@ -1803,33 +2197,35 @@ semantic_contribution = semantic_hits / (exact_hits + semantic_hits)
 | `cache.write.failures` | Failed cache writes per minute | > 0 |
 | `cache.invalidation.count` | Entries invalidated per minute | Spike monitoring |
 | `cache.entries.total` | Total active cache entries | Capacity monitoring |
-| `cache.redis.memory_usage` | Redis memory utilization | > 80% |
-| `cache.redis.evictions` | LRU evictions per minute | > 100/min |
 | `cache.cost_saved_usd` | Estimated cost savings per hour | Trend monitoring |
 | `cache.tokens_saved` | Tokens saved per hour (input + output) | Trend monitoring |
-| `cache.embedding.latency` | Bedrock embedding generation latency | p99 > 200ms |
+| `cache.embedding.latency` | Model Gateway embedding latency | p99 > 200ms |
 | `cache.opensearch.latency` | OpenSearch kNN query latency | p99 > 150ms |
+| `cache.dynamodb.getitem_latency` | DynamoDB GetItem latency for exact match | p99 > 20ms |
 
 ### Structured Logging
 
-All log entries follow the platform standard JSON format:
+All log entries follow the platform standard JSON format using `structlog`:
 
 ```json
 {
   "timestamp": "2026-02-10T12:00:00.123Z",
   "level": "INFO",
+  "message": "cache_lookup_completed",
   "service": "cache-layer",
+  "function_name": "cache-api",
   "request_id": "req-uuid-456",
+  "trace_id": "1-abc123-def456",
+  "application_id": "scicoms",
   "client_id": "acme-corp",
+  "workspace_id": "ws_01JKX...",
   "project_id": "customer-support",
-  "event": "cache_lookup",
   "status": "hit",
   "source": "semantic",
   "similarity_score": 0.946,
-  "matched_query": "What's the process for resetting my password?",
-  "exact_match_ms": 3,
+  "exact_match_ms": 7,
   "semantic_ms": 84,
-  "total_latency_ms": 87,
+  "total_latency_ms": 91,
   "cache_entry_id": "ce-01JKX001...",
   "tokens_saved_input": 245,
   "tokens_saved_output": 180,
@@ -1837,25 +2233,27 @@ All log entries follow the platform standard JSON format:
 }
 ```
 
+Required fields per `constitution/coding-standards.md`: `timestamp`, `level`, `message`, `request_id`, `trace_id`, `service`, `function_name`.
+
 ### CloudWatch Dashboard
 
 The Cache Layer publishes a pre-configured CloudWatch dashboard with:
 
 1. **Cache Performance**: Hit rate over time (exact + semantic breakdown), miss rate
-2. **Latency**: Lookup latency percentiles, write latency, per-stage breakdown
+2. **Latency**: Lookup latency percentiles, write latency, per-stage breakdown (DynamoDB GetItem, OpenSearch kNN, embedding generation)
 3. **Cost Savings**: Estimated USD saved, tokens saved, trending over time
-4. **Infrastructure Health**: Redis memory usage, eviction rate, OpenSearch OCU utilization
+4. **Infrastructure Health**: DynamoDB consumed capacity, OpenSearch CPU/memory utilization
 5. **Invalidation Activity**: Invalidation events, entries purged, event sources
-6. **Per-Client View**: Filterable by client_id for tenant-specific monitoring
+6. **Per-Client View**: Filterable by `application_id` + `client_id` for tenant-specific monitoring
 
 ### Alerting
 
 | Alert | Condition | Action |
 |-------|-----------|--------|
 | Low hit rate | Hit rate < 20% for 1 hour | Investigate — threshold too high or cache not populated |
-| High miss latency | p99 miss latency > 500ms | Investigate — Bedrock or OpenSearch slow |
-| Redis memory pressure | Memory > 85% | Scale Redis node type or review TTLs |
-| High eviction rate | > 500 evictions/min | Redis undersized — scale up |
-| Cache write failures | Any write failure count > 0 | Investigate — DynamoDB or Redis issue |
+| High miss latency | p99 miss latency > 500ms | Investigate — Model Gateway or OpenSearch slow |
+| Cache write failures | Any write failure count > 0 | Investigate — DynamoDB issue |
 | Invalidation spike | > 1000 invalidations in 5 min | Investigate — mass update event or misconfigured trigger |
-| Embedding generation failures | > 0 failures | Investigate — Bedrock quota or availability |
+| Embedding generation failures | > 0 failures | Investigate — Model Gateway quota or availability |
+| DynamoDB throttling | Any throttled requests | Review on-demand capacity or access patterns |
+| OpenSearch high CPU | CPU > 80% for 15 min | Consider scaling to larger instance type |
