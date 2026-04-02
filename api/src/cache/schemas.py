@@ -64,6 +64,7 @@ class CacheLookupRequest(ApiModel):
     project_id: str
     query: str
     request_id: str | None = None
+    context_hash: str | None = None
     lookup_config: LookupConfig = Field(default_factory=LookupConfig)
 
 
@@ -95,6 +96,7 @@ class CacheWriteRequest(ApiModel):
     query: str
     response: CachedResponse
     request_id: str | None = None
+    context_hash: str | None = None
     write_config: WriteConfig = Field(default_factory=WriteConfig)
 
 

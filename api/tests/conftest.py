@@ -225,3 +225,19 @@ def _reset_circuit_breakers():
 
     embed_cb.reset()
     os_cb.reset()
+
+
+@pytest.fixture
+def cache_repo(dynamodb_tables):
+    """Create a CacheRepository connected to mocked DynamoDB."""
+    from src.cache.repository import CacheRepository
+
+    return CacheRepository(dynamodb_tables, application_id="test-app", client_id="test-client")
+
+
+@pytest.fixture
+def cache_service(cache_repo):
+    """Create a CacheService with real repository (no semantic features)."""
+    from src.cache.service import CacheService
+
+    return CacheService(cache_repo)

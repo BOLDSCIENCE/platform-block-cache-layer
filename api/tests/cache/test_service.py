@@ -125,7 +125,7 @@ class TestLookup:
         service.lookup(req)
 
         expected_hash = compute_query_hash(normalize_query("  How Do I  Reset My Password??  "))
-        mock_repo.get_by_hash.assert_called_once_with("ws_01", "proj_01", expected_hash)
+        mock_repo.get_by_hash.assert_called_once_with("ws_01", "proj_01", expected_hash, None)
 
     def test_lookup_increments_hit_count(self, service, mock_repo):
         entry = _make_entry()
@@ -698,3 +698,79 @@ class TestWriteCitationLinks:
         service.write(req)
 
         mock_repo.put_citation_links.assert_not_called()
+
+
+class TestContextAwareLookup:
+    """Tests for context-aware caching via context_hash."""
+
+    def test_same_query_different_context_are_separate(self, cache_service, cache_repo):
+        """Two writes with same query but different context_hash produce separate entries."""
+        from src.cache.schemas import CachedResponse, CacheLookupRequest, CacheWriteRequest
+
+        base_write = {
+            "workspace_id": "ws_01",
+            "project_id": "proj_01",
+            "query": "How do I reset my password?",
+            "response": CachedResponse(
+                content="Answer A", model="m", tokens_used={"input": 10, "output": 20}
+            ),
+        }
+
+        # Write with context_hash "ctx_A"
+        req_a = CacheWriteRequest(**base_write, context_hash="ctx_A")
+        cache_service.write(req_a)
+
+        # Write with context_hash "ctx_B"
+        req_b = CacheWriteRequest(
+            **{
+                **base_write,
+                "response": CachedResponse(
+                    content="Answer B", model="m", tokens_used={"input": 10, "output": 20}
+                ),
+            },
+            context_hash="ctx_B",
+        )
+        cache_service.write(req_b)
+
+        # Lookup with ctx_A should get Answer A
+        lookup_a = CacheLookupRequest(
+            workspace_id="ws_01",
+            project_id="proj_01",
+            query="How do I reset my password?",
+            context_hash="ctx_A",
+        )
+        result_a = cache_service.lookup(lookup_a)
+        assert result_a.status == "hit"
+        assert result_a.response.content == "Answer A"
+
+        # Lookup with ctx_B should get Answer B
+        lookup_b = CacheLookupRequest(
+            workspace_id="ws_01",
+            project_id="proj_01",
+            query="How do I reset my password?",
+            context_hash="ctx_B",
+        )
+        result_b = cache_service.lookup(lookup_b)
+        assert result_b.status == "hit"
+        assert result_b.response.content == "Answer B"
+
+    def test_no_context_hash_backward_compatible(self, cache_service):
+        """Lookup without context_hash works the same as before."""
+        from src.cache.schemas import CachedResponse, CacheLookupRequest, CacheWriteRequest
+
+        req = CacheWriteRequest(
+            workspace_id="ws_01",
+            project_id="proj_01",
+            query="test query?",
+            response=CachedResponse(content="answer", model="m", tokens_used={}),
+        )
+        cache_service.write(req)
+
+        lookup = CacheLookupRequest(
+            workspace_id="ws_01",
+            project_id="proj_01",
+            query="test query?",
+        )
+        result = cache_service.lookup(lookup)
+        assert result.status == "hit"
+        assert result.response.content == "answer"

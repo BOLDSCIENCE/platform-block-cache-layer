@@ -53,13 +53,16 @@ class CacheRepository:
         workspace_id: str,
         project_id: str,
         query_hash: str,
+        context_hash: str | None = None,
     ) -> CacheEntryModel | None:
         """Look up a cache entry by query hash via GSI1 (QueryHash).
 
         Returns the first active entry matching the hash within the given scope,
         or None if no match is found.
         """
-        gsi_pk = build_gsi_query_hash_pk(self.application_id, self.client_id, query_hash)
+        gsi_pk = build_gsi_query_hash_pk(
+            self.application_id, self.client_id, query_hash, context_hash
+        )
 
         response = self.table.query(
             IndexName="GSI1",
@@ -81,7 +84,9 @@ class CacheRepository:
         """Write a cache entry to DynamoDB."""
         pk = build_pk(self.application_id, self.client_id)
         sk = build_cache_sk(entry.workspace_id, entry.project_id, entry.cache_entry_id)
-        gsi1pk = build_gsi_query_hash_pk(self.application_id, self.client_id, entry.query_hash)
+        gsi1pk = build_gsi_query_hash_pk(
+            self.application_id, self.client_id, entry.query_hash, entry.context_hash
+        )
         gsi1sk = f"CACHE#{entry.cache_entry_id}"
         gsi2pk = build_gsi_project_entries_pk(
             self.application_id, self.client_id, entry.workspace_id, entry.project_id
@@ -117,6 +122,9 @@ class CacheRepository:
 
         if entry.guardrail_policy_version:
             item["guardrail_policy_version"] = entry.guardrail_policy_version
+
+        if entry.context_hash:
+            item["context_hash"] = entry.context_hash
 
         try:
             self.table.put_item(Item=item)
@@ -421,4 +429,5 @@ class CacheRepository:
             original_request_id=item.get("original_request_id") or None,
             status=item.get("status", "active"),
             ttl=int(item.get("ttl", 0)),
+            context_hash=item.get("context_hash"),
         )

@@ -69,7 +69,7 @@ class CacheService:
 
         if request.lookup_config.enable_exact_match:
             entry = self.repository.get_by_hash(
-                request.workspace_id, request.project_id, query_hash
+                request.workspace_id, request.project_id, query_hash, request.context_hash
             )
 
         exact_ms = (time.monotonic() - exact_start) * 1000
@@ -251,6 +251,7 @@ class CacheService:
             original_request_id=request.request_id,
             status="active",
             ttl=ttl_epoch,
+            context_hash=request.context_hash,
         )
 
         self.repository.put(entry)
