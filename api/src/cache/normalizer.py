@@ -44,12 +44,18 @@ def build_cache_sk(workspace_id: str, project_id: str, cache_entry_id: str) -> s
     return f"CACHE#WS#{workspace_id}#PROJ#{project_id}#{cache_entry_id}"
 
 
-def build_gsi_query_hash_pk(application_id: str, client_id: str, query_hash: str) -> str:
+def build_gsi_query_hash_pk(
+    application_id: str, client_id: str, query_hash: str, context_hash: str | None = None
+) -> str:
     """Build GSI1 (QueryHash) partition key for exact match lookup.
 
     Format: APP#{application_id}#CLIENT#{client_id}#HASH#{query_hash}
+    With context: APP#{application_id}#CLIENT#{client_id}#HASH#{query_hash}#CTX#{context_hash}
     """
-    return f"APP#{application_id}#CLIENT#{client_id}#HASH#{query_hash}"
+    base = f"APP#{application_id}#CLIENT#{client_id}#HASH#{query_hash}"
+    if context_hash:
+        return f"{base}#CTX#{context_hash}"
+    return base
 
 
 def build_gsi_project_entries_pk(

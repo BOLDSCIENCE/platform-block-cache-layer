@@ -29,6 +29,7 @@ class CacheEntryModel:
     ttl: int = 0
     query_embedding: list[float] | None = field(default=None)
     embedding_model: str | None = None
+    context_hash: str | None = None
 
 
 @dataclass

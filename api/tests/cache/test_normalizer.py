@@ -72,3 +72,17 @@ class TestKeyBuilders:
     def test_build_gsi_project_entries_pk(self):
         pk = build_gsi_project_entries_pk("scicoms", "acme-corp", "ws_01", "proj_01")
         assert pk == "APP#scicoms#CLIENT#acme-corp#WS#ws_01#PROJ#proj_01"
+
+
+class TestBuildGsiQueryHashPkWithContext:
+    def test_without_context_hash(self):
+        result = build_gsi_query_hash_pk("app1", "client1", "abc123")
+        assert result == "APP#app1#CLIENT#client1#HASH#abc123"
+
+    def test_with_context_hash(self):
+        result = build_gsi_query_hash_pk("app1", "client1", "abc123", context_hash="ctx_99")
+        assert result == "APP#app1#CLIENT#client1#HASH#abc123#CTX#ctx_99"
+
+    def test_with_none_context_hash(self):
+        result = build_gsi_query_hash_pk("app1", "client1", "abc123", context_hash=None)
+        assert result == "APP#app1#CLIENT#client1#HASH#abc123"
